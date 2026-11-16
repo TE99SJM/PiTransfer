@@ -1,0 +1,22 @@
+[Unit]
+Description=PiTransfer USB to NAS transfer station
+Wants=network-online.target mnt-pidropnas.mount
+After=network-online.target mnt-pidropnas.mount
+
+[Service]
+Type=simple
+User=pidrop
+Group=pidrop
+WorkingDirectory=/opt/pi-nas-drop
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/gunicorn --bind 127.0.0.1:8090 --workers 1 --threads 4 --timeout 120 --access-logfile /dev/null app:create_app()
+Restart=on-failure
+RestartSec=5
+UMask=0077
+LimitCORE=0
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pi-nas-drop
+
+[Install]
+WantedBy=multi-user.target

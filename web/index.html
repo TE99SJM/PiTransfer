@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PiTransfer · USB to NAS</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body><main>
+<header><div class="brand"><span class="mark">↓</span><div><strong>PiTransfer</strong><small>USB → NAS</small></div></div><button id="logout" class="quiet" hidden>Sign out</button></header>
+<div id="notice" role="status" hidden></div>
+<section id="login" class="login card"><span class="eyebrow">YOUR TRANSFER STATION</span><h1>Plug in.<br>Send home.</h1><p>Copy files from your drives to your NAS.<br>No previews. No playback. Just transfer.</p><form id="login-form"><label for="password">App password</label><input type="password" id="password" autocomplete="current-password" required><button type="submit">Sign in</button></form><small>Use your private HTTPS address or SSH tunnel.</small></section>
+<div id="dashboard" hidden>
+<section class="intro"><div><span class="eyebrow">TRANSFER STATION</span><h1>Your files. On their way.</h1><p>Choose a drive, select your files, and copy them home.</p></div><span class="pill">Originals stay untouched</span></section>
+<section class="nas card"><div><span class="eyebrow">DESTINATION</span><h2 id="nas-title">Checking NAS…</h2><p id="nas-detail"></p></div><span id="nas-status" class="pill">Checking</span></section>
+<div class="columns"><section class="card"><div class="section-head"><h2>Connected drives</h2><button id="refresh" class="quiet">Refresh</button></div><p class="muted">USB drives and USB card readers appear here.</p><div id="drives"></div></section>
+<section class="card"><div class="section-head"><h2 id="files-title">Choose a drive</h2><button id="up" class="quiet" hidden>↑ Up</button></div><p id="breadcrumb" class="path">File names and folders only</p><div id="files" class="files"><p class="empty">Connect a drive to get started.</p></div><div class="pagination"><button id="previous" class="quiet" hidden>Previous</button><button id="next" class="quiet" hidden>Next</button></div><div class="actions"><button id="copy-selected" disabled>Copy selected</button><button id="copy-all" class="secondary" disabled>Copy entire drive</button></div><small>Copied directly to NAS, then checked with SHA-256.</small></section></div>
+<section class="card history"><div class="section-head"><h2>Transfers</h2><span class="muted">Latest 30</span></div><div id="jobs"><p class="empty">Your transfers will appear here.</p></div></section>
+<footer>Read-only sources <span>·</span> Encrypted NAS connection <span>·</span> No local file staging</footer>
+</div></main></body></html>
