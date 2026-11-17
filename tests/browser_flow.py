@@ -16,6 +16,7 @@ from wsgiref.simple_server import make_server, WSGIRequestHandler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import App
 from tests.test_cameras import DEVICE, FakeCamera
+from tests.test_cleanup import DeletableCamera
 from tests.test_transfer import FakeHardware
 from tests.test_web import config
 from playwright.sync_api import sync_playwright, expect
@@ -29,7 +30,7 @@ class QuietHandler(WSGIRequestHandler):
 def main():
     with tempfile.TemporaryDirectory() as temp:
         hardware = FakeHardware(temp)
-        camera = FakeCamera()
+        camera = DeletableCamera()
         cameras = {DEVICE:camera}
         hardware.camera_source = lambda device: cameras[device]
         available = [{"id": DEVICE, "label": "GoPro HERO9 Black", "kind": "camera",
@@ -83,7 +84,7 @@ def main():
                     assert len(dialogs) == 1
                     job = application.transfers.snapshot()[0]
                     assert job['state'] == 'complete', job
-                    assert (hardware.dst/job['destination']/'data/DCIM/100GOPRO/photo.RAW').read_bytes() == b'raw'
+                    assert (hardware.dst/job['output_folders'][0]/'photo.RAW').read_bytes() == b'raw'
                     expect(page.locator('#jobs')).to_contain_text('Estimated total: 2 file(s)')
 
                     camera.unknown_size = True
@@ -105,12 +106,13 @@ def main():
                     expect(page.locator('#check-size')).to_be_enabled()
 
                     # Reproduce the older install's final SMB rename failure.
-                    rename = os.rename
-                    def deny_rename(src, dst, **kwargs):
+                    from organize import rename_exclusive
+                    rename = rename_exclusive
+                    def deny_rename(src_fd, src, dst_fd, dst):
                         if str(src).startswith('.incomplete-'):
                             raise PermissionError(errno.EACCES, 'Permission denied', src, None, dst)
-                        return rename(src, dst, **kwargs)
-                    with patch('core.os.rename', side_effect=deny_rename):
+                        return rename(src_fd, src, dst_fd, dst)
+                    with patch('organize.rename_exclusive', side_effect=deny_rename):
                         application.transfers.start(DEVICE, ['note.txt'])
                         deadline = time.monotonic() + 5
                         while time.monotonic() < deadline:
@@ -135,6 +137,15 @@ def main():
                     expect(page.locator('#jobs .job-top .pill').first).to_have_text('complete', timeout=15000)
                     assert camera.opened == downloads, 'Finalization downloaded the camera files again'
                     expect(page.locator('#jobs .job').first).to_contain_text('1 saved files rechecked')
+
+                    legacy_card=page.locator(f'[data-job-id="{failed["id"]}"]')
+                    expect(legacy_card.get_by_role('button',name='Organize by date')).to_be_enabled()
+                    page.once('dialog',lambda dialog:dialog.accept())
+                    legacy_card.get_by_role('button',name='Organize by date').click()
+                    expect(legacy_card).to_contain_text('GoPro_HERO9_Black_',timeout=15000)
+                    expect(legacy_card.get_by_role('button',name='Organize by date')).to_have_count(0)
+                    assert failed['publication_complete'],failed
+                    assert camera.opened==downloads,'Organizing read original media again'
 
                     # A progress bar exists for old resume jobs and for every camera.
                     assert abs(page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") - 28) < 1e-9
@@ -179,11 +190,36 @@ def main():
                         gate.set()
                         camera.stream = original_stream
 
+                    # Deletion has its own confirmation and preserves the NAS outputs.
+                    copied_card=page.locator(f'[data-job-id="{job["id"]}"]')
+                    delete=copied_card.get_by_role('button',name='Delete verified originals')
+                    expect(delete).to_be_enabled()
+                    page.once('dialog',lambda dialog:dialog.dismiss())
+                    delete.click()
+                    expect(delete).to_be_enabled()
+                    assert 'DCIM/100GOPRO/photo.RAW' in camera.files
+                    page.once('dialog',lambda dialog:dialog.accept('wrong'))
+                    delete.click()
+                    expect(page.locator('#notice')).to_contain_text('Nothing was deleted')
+                    expect(delete).to_be_enabled()
+                    def confirm_delete(dialog):
+                        assert '2 verified originals' in dialog.message
+                        assert 'NAS copies are kept' in dialog.message
+                        dialog.accept('DELETE 2')
+                    page.once('dialog',confirm_delete)
+                    delete.click()
+                    expect(copied_card).to_contain_text('Original deletion: complete',timeout=15000)
+                    assert 'DCIM/100GOPRO/photo.RAW' not in camera.files
+                    assert 'DCIM/100GOPRO/clip.MP4' not in camera.files
+                    assert 'note.txt' in camera.files
+                    assert (hardware.dst/job['output_folders'][0]/'photo.RAW').read_bytes()==b'raw'
+                    expect(delete).to_have_count(0)
+
                     page.set_viewport_size({"width":390,"height":844})
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'
                     assert not errors, errors
                     browser.close()
-                    print('Browser checks passed: folders, sizing, cancellation, transfer/resume, per-camera bars, second-camera queue, completion percentages, and mobile width.')
+                    print('Browser checks passed: folders, sizing, cancellation, transfer/resume, per-camera bars, second-camera queue, completion percentages, date organization, confirmed original deletion, and mobile width.')
             finally:
                 server.shutdown()
 

@@ -33,7 +33,7 @@ class UpdateTest(unittest.TestCase):
         self.original_config = self.config.read_bytes()
         self.checkout = self.base / "checkout"
         self.checkout.mkdir()
-        for name in ("app.py", "core.py", "drive_helper.py", "camera.py", "camera_worker.py"):
+        for name in ("app.py", "core.py", "drive_helper.py", "camera.py", "camera_worker.py", "organize.py", "metadata_worker.py", "cleanup.py"):
             shutil.copyfile(ROOT / name, self.checkout / name)
         shutil.copytree(ROOT / "web", self.checkout / "web")
         shutil.copytree(ROOT / "udev", self.checkout / "udev")
@@ -72,7 +72,8 @@ class UpdateTest(unittest.TestCase):
         result = self.run_update()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.current / "app.py").read_bytes(), (ROOT / "app.py").read_bytes())
-        self.assertTrue((self.current / "camera_worker.py").exists())
+        for name in ("camera_worker.py", "organize.py", "metadata_worker.py", "cleanup.py"):
+            self.assertTrue((self.current / name).exists())
         backups = list(self.opt.glob("*.previous"))
         self.assertEqual(len(backups), 1)
         self.assertEqual((backups[0] / "app.py").read_text(), "old application")
@@ -80,7 +81,7 @@ class UpdateTest(unittest.TestCase):
         self.assert_settings_retained()
 
     def test_active_transfer_blocks_service_stop(self):
-        for state in ('queued', 'starting', 'counting', 'copying', 'resuming', 'finalizing'):
+        for state in ('queued', 'starting', 'counting', 'copying', 'resuming', 'finalizing', 'organizing', 'deleting'):
             with self.subTest(state=state):
                 self.history.write_text(json.dumps([{'state':state}]))
                 result = self.run_update()

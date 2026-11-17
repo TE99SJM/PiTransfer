@@ -1,4 +1,4 @@
-"""Unprivileged, short-lived libgphoto2 worker. No capture, preview or write API.
+"""Unprivileged, short-lived libgphoto2 worker. No capture or preview API; deletion requires a verified-copy handshake.
 
 Metadata is JSON; a download writes only the original object's bytes to stdout.
 The fd-backed CameraFile streams through a pipe instead of staging on the Pi.
@@ -208,6 +208,23 @@ def download(gp, camera, path, expected):
         del camera_file
 
 
+def delete_verified(gp, camera, path, expected, confirm):
+    """Stream the original, then await the parent's source/NAS hash approval.
+
+    Keep this camera session open so the object cannot be silently substituted
+    by a reconnect between verification and the final delete command.
+    """
+    download(gp, camera, path, expected)
+    print(json.dumps({"ready": True}), flush=True)
+    if confirm() != {"delete": True}:
+        raise ValueError("Original deletion was not confirmed")
+    if file_info(gp, camera, path) != expected:
+        raise RuntimeError("Camera file changed after verification; original was kept")
+    names = components(path)
+    camera.file_delete("/" + "/".join(names[:-1]), names[-1])
+    print(json.dumps({"deleted": True}), flush=True)
+
+
 def main():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     # Bound native driver allocations too. A driver requiring a whole large file
@@ -220,7 +237,7 @@ def main():
     version = tuple(int(x) for x in gp.__version__.split(".")[:2])
     if version < (2, 5):
         raise RuntimeError("Camera streaming requires python3-gphoto2 2.5 or newer (Raspberry Pi OS/Debian Trixie). USB drives still work.")
-    request = json.loads(sys.stdin.buffer.read(1024 * 1024 + 1))
+    request = json.loads(sys.stdin.buffer.readline(1024 * 1024 + 1))
     if not isinstance(request, dict):
         raise ValueError("Invalid camera request")
     action = request.get("action")
@@ -229,7 +246,7 @@ def main():
         if not isinstance(excluded, list) or len(excluded) > 10 or any(not isinstance(p, str) or not USB_PORT.fullmatch(p) for p in excluded):
             raise ValueError("Invalid excluded camera ports")
         result = discover(gp, exclude=excluded)
-    elif action in ("list", "stat", "download", "estimate"):
+    elif action in ("list", "stat", "download", "estimate", "delete_verified"):
         path = request.get("path", "")
         components(path)
         with open_camera(gp, request.get("device")) as camera:
@@ -246,6 +263,10 @@ def main():
                 result = estimate(gp, camera, request["paths"],
                                   lambda totals: print(json.dumps(totals), flush=True))
                 result["complete"] = True
+            elif action == "delete_verified":
+                delete_verified(gp, camera, path, request["expected"],
+                                lambda: json.loads(sys.stdin.buffer.readline(1024)))
+                return
             else:
                 download(gp, camera, path, request["expected"])
                 return

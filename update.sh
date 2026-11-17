@@ -14,15 +14,15 @@ python3 - <<'PY'
 import ast
 import json
 from pathlib import Path
-for name in ('app.py', 'core.py', 'drive_helper.py', 'camera.py', 'camera_worker.py'):
+for name in ('app.py', 'core.py', 'drive_helper.py', 'camera.py', 'camera_worker.py', 'organize.py', 'metadata_worker.py', 'cleanup.py'):
     ast.parse(Path(name).read_text(), filename=name)
 config = json.loads(Path('/etc/pi-nas-drop/config.json').read_text())
 history = Path(config['history_path'])
-if history.exists() and any(j['state'] in ('queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing') for j in json.loads(history.read_text())):
+if history.exists() and any(j['state'] in ('queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing', 'organizing', 'deleting') for j in json.loads(history.read_text())):
     raise SystemExit('A transfer is active. Finish or cancel it in PiTransfer before updating.')
 PY
 apt-get update
-apt-get install -y --no-install-recommends python3-gphoto2 gphoto2 libmtp-runtime
+apt-get install -y --no-install-recommends python3-gphoto2 gphoto2 libmtp-runtime libimage-exiftool-perl
 python3 -c 'import gphoto2'
 stage=$(mktemp -d /opt/pi-nas-drop.update.XXXXXX)
 backup="${stage}.previous"
@@ -47,7 +47,7 @@ cleanup() {
 trap cleanup EXIT
 chmod 0755 "$stage"
 install -d -o root -g root -m 0755 "$stage/web"
-install -o root -g root -m 0644 app.py core.py drive_helper.py camera.py camera_worker.py "$stage/"
+install -o root -g root -m 0644 app.py core.py drive_helper.py camera.py camera_worker.py organize.py metadata_worker.py cleanup.py "$stage/"
 install -o root -g root -m 0644 web/index.html web/style.css web/app.js "$stage/web/"
 # Check again because apt may have taken a while. Stop only after transfers finish.
 python3 - <<'PY'
@@ -55,7 +55,7 @@ import json
 from pathlib import Path
 c = json.loads(Path('/etc/pi-nas-drop/config.json').read_text())
 p = Path(c['history_path'])
-if p.exists() and any(j['state'] in ('queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing') for j in json.loads(p.read_text())):
+if p.exists() and any(j['state'] in ('queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing', 'organizing', 'deleting') for j in json.loads(p.read_text())):
     raise SystemExit('A transfer started during preparation. Finish it before updating.')
 PY
 systemctl stop pi-nas-drop.service

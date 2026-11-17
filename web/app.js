@@ -4,7 +4,8 @@ let csrf = '', device = null, currentPath = '', offset = 0, nasReady = false, bu
 let selected = new Set(), devices = [], jobsState = [], jobsPolling = false;
 let sizing = false, serverSizing = false, preparing = false, sizeResult = null, sizeKey = '', sizeJobId = null, nasFree = null;
 let nasShare = '', nasFolder = '', nasBrowsePath = '', nasOffset = 0, nasLoading = false;
-const activeStates = new Set(['queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing']);
+const activeStates = new Set(['queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing', 'organizing', 'deleting']);
+const importTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const sizeStates = new Set(['queued', 'counting']);
 function node(tag, text, cls) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -41,7 +42,7 @@ function controls() {
       ? (!nasReady || sizing || serverSizing || preparing || jobsState.some(j=>j.device===b.dataset.device && activeStates.has(j.state)))
       : (blocked || b.dataset.usable === 'false');
   }
-  for (const b of $('jobs').querySelectorAll('.resume-transfer')) b.disabled = blocked || !nasReady;
+  for (const b of $('jobs').querySelectorAll('.resume-transfer, .delete-originals, .organize-transfer')) b.disabled = blocked || !nasReady;
 }
 function invalidateSize() {
   sizeResult = null; sizeKey = '';
@@ -156,6 +157,11 @@ async function browse() {
   });controls();
 }
 function jobProgress(j) {
+  if(j.state==='deleting') {
+    const c=j.cleanup||{},total=c.total_bytes||0;
+    return {percent:total?Math.min(99.9,(c.phase_bytes||0)/total*100):null,title:'Rechecking and deleting originals',detail:`${c.files||0} of ${c.total_files||0} originals deleted · ${bytes(c.phase_bytes||0)} checked`};
+  }
+  if(j.state==='organizing') return {percent:j.phase_total?Math.min(99.9,(j.phase_bytes||0)/j.phase_total*100):null,title:'Organizing by camera and date',detail:`${j.published_files||0} of ${j.files} files placed in date folders`};
   const done=['complete','complete_with_skips'].includes(j.state), stopped=['failed','cancelled','interrupted'].includes(j.state);
   const clamp=n=>Math.max(0,Math.min(done?100:99.9,n));
   if(done) return {percent:100,title:'Complete',detail:`${bytes(j.bytes)} · ${j.files} files verified`};
@@ -198,13 +204,21 @@ function renderJobs(jobs) {
     if(Number.isFinite(j.total_bytes)) {
       row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
     }
-    if(j.current)row.append(node('p',j.current,'path'));if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
-    if(activeStates.has(j.state))row.append(button(j.state==='queued'?'Remove from queue':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
+    if(j.current)row.append(node('p',j.current,'path'));if(j.output_folders?.length) { for(const folder of j.output_folders) row.append(node('p',folder,'path')); } else if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
+    if(activeStates.has(j.state))row.append(button(j.state==='queued'?'Remove from queue':j.state==='deleting'?'Stop deleting':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
     if(j.can_resume) {
       row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
       row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
     } else if(['failed','cancelled','interrupted'].includes(j.state)) {
       row.append(node('p','This older transfer has no saved selection for resuming. Its NAS files are retained.'));
+    }
+    if(j.can_organize) row.append(button('Organize by date',()=>organizeTransfer(j),'secondary organize-transfer'));
+    if(j.can_delete) row.append(button('Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
+    if(j.cleanup) {
+      const c=j.cleanup;
+      row.append(node('p',`Original deletion: ${c.state} · ${c.files||0} of ${c.total_files||0} deleted in this operation`,'cleanup-detail'));
+      if(c.current && j.state==='deleting') row.append(node('p',c.current,'path'));
+      if(c.error) row.append(node('p',c.error,'cleanup-error'));
     }
     $('jobs').append(row);
   }controls();
@@ -212,8 +226,8 @@ function renderJobs(jobs) {
 async function queueDevice(d) {
   preparing=true;controls();
   try {
-    if(!confirm(`Queue all accessible files from ${d.label} to a new folder inside ${destinationName()}?\nThe Pi copies one device at a time. Size is checked when this transfer starts. Keep the device connected. Originals stay unchanged.`)) return;
-    await api('queue',{device:d.id,destination_folder:nasFolder});
+    if(!confirm(`Queue all accessible files from ${d.label} into camera_date folders inside ${destinationName()}?\nThe Pi copies one device at a time. Size is checked when this transfer starts. Keep the device connected. Originals stay unchanged.`)) return;
+    await api('queue',{device:d.id,destination_folder:nasFolder,import_timezone:importTimezone});
     notice(`${d.label} added to the transfer queue. You can close this window.`);
     await refresh();
   } finally {preparing=false;controls();}
@@ -229,6 +243,27 @@ async function resumeTransfer(job) {
     await api('resume',{id:job.id,device:source});
     notice('Resume started on the Pi. You can close this window and check progress later.');
     await refresh();
+  } finally {preparing=false;controls();}
+}
+async function organizeTransfer(job) {
+  preparing=true;controls();
+  try {
+    if(!confirm(`Move this completed import into camera_date folders inside ${destinationName(job.destination_folder||'')}?\nEach NAS file is checked before moving. Existing filenames are protected. Recording dates use ${importTimezone}; missing dates fall back to the file timestamp or Unknown-date.`)) return;
+    await api('organize',{id:job.id,import_timezone:importTimezone});
+    notice('Organizing on the Pi. You can close this window.');await refresh();
+  } finally {preparing=false;controls();}
+}
+async function deleteOriginals(job) {
+  preparing=true;controls();
+  try {
+    const source=device || job.device;
+    if(!devices.some(d=>d.id===source && d.usable)) throw new Error('Reconnect and select the original camera or drive, then try again.');
+    const prepared=await api('delete/prepare',{id:job.id,device:source});
+    const answer=prompt(`Permanently delete ${prepared.files} verified originals (${bytes(prepared.bytes)}) from ${prepared.source}?\nThe Pi rechecks each original and its NAS copy before deletion. Changed or missing files stop the operation. NAS copies are kept.\nType ${prepared.confirmation} to confirm.`);
+    if(answer===null) return;
+    if(answer!==prepared.confirmation) throw new Error('Confirmation did not match. Nothing was deleted.');
+    await api('delete/confirm',{token:prepared.token,confirmation:answer});
+    notice('Verification and original deletion started on the Pi. Stop deleting prevents later files from being deleted.');await refresh();
   } finally {preparing=false;controls();}
 }
 async function refresh() {
@@ -261,8 +296,8 @@ async function transfer(paths) {
     nasFree=destination.free;renderDestination();renderEstimate(estimate);
     if(estimate.bytes+16*1024*1024>nasFree) throw new Error('Not enough free space on the NAS for this selection.');
     const skipped=estimate.skipped?`\n${estimate.skipped} unsupported item(s) will be skipped.`:'';
-    if(!confirm(`Copy ${estimate.files} file(s), ${sizeText(estimate)}, from ${name} to a NEW folder inside ${destinationName(requestedFolder)}?${skipped}\nOriginals will stay on the device.`)) return;
-    await api('transfer',{device:requestedDevice,paths,estimate_id:estimate.id,destination_folder:requestedFolder});
+    if(!confirm(`Copy ${estimate.files} file(s), ${sizeText(estimate)}, from ${name} into camera_date folders inside ${destinationName(requestedFolder)}?${skipped}\nDifferent recording dates get separate folders. Date timezone: ${importTimezone}.\nOriginals will stay on the device.`)) return;
+    await api('transfer',{device:requestedDevice,paths,estimate_id:estimate.id,destination_folder:requestedFolder,import_timezone:importTimezone});
     selected.clear();invalidateSize();
     for(const input of $('files').querySelectorAll('input')) input.checked=false;
     notice('Transfer started on the Pi. You can close this window and check progress later.');

@@ -18,7 +18,7 @@ CHUNK = 1024 * 1024
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-ACTIVE = {"queued", "starting", "counting", "copying", "verifying", "resuming", "finalizing"}
+ACTIVE = {"queued", "starting", "counting", "copying", "verifying", "resuming", "finalizing", "organizing", "deleting"}
 RETRYABLE = {"failed", "cancelled", "interrupted"}
 ESTIMATING = {"queued", "counting"}
 
@@ -85,7 +85,7 @@ def folder_listing(root_fd, path="", offset=0):
     items, seen, more = [], 0, False
     with directory(root_fd, path) as fd, os.scandir(fd) as entries:
         for entry in entries:
-            if not entry.is_dir(follow_symlinks=False):
+            if entry.name.startswith((".pitransfer-", ".incomplete-")) or not entry.is_dir(follow_symlinks=False):
                 continue
             if seen < offset:
                 seen += 1
@@ -131,6 +131,41 @@ class Hardware:
     def source(self, device):
         mounted = self.helper("mount", device)
         return os.open(mounted["path"], DIRECTORY)
+
+    def delete_verified(self, device, entry, check, progress):
+        if not isinstance(device,str) or not re.fullmatch(r"[0-9]+:[0-9]+:[0-9a-f]{16}",device):
+            raise ValueError("Invalid device")
+        request={k:entry[k] for k in ("path","size","sha256","backup_path")}
+        command=["/usr/bin/sudo","-n","/usr/bin/python3","-I","/opt/pi-nas-drop/drive_helper.py","delete",device]
+        process=subprocess.Popen(command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        authorized=False;deleted=False;pending=b""
+        def before_authorization():
+            if not authorized: check()
+        try:
+            process.stdin.write((json.dumps(request)+"\n").encode());process.stdin.flush()
+            for chunk in self.cameras._chunks(process,before_authorization):
+                pending+=chunk
+                while b"\n" in pending:
+                    line,pending=pending.split(b"\n",1);response=json.loads(line)
+                    if set(response)=={"bytes"} and type(response["bytes"]) is int and response["bytes"]>=0:
+                        progress(response["bytes"])
+                    elif response=={"ready":True} and not authorized:
+                        check()
+                        process.stdin.write(b'{"delete":true}\n');process.stdin.flush()
+                        authorized=True;process.stdin.close()
+                    elif response=={"deleted":True} and authorized and not deleted:
+                        deleted=True
+                    else: raise ValueError("Invalid drive deletion response")
+                if len(pending)>65536: raise ValueError("Invalid drive deletion response")
+            if pending or not deleted: raise RuntimeError("Deletion was not acknowledged; inspect the source before retrying")
+        finally:
+            process.stdin.close()
+            if process.poll() is None and not authorized:
+                # No authorization was sent, so the root helper cannot remount RW.
+                process.terminate()
+            # Once authorized, allow the helper to restore RO. Never SIGKILL it.
+            process.wait()
+            process.stdout.close();process.stderr.close()
 
     def eject(self, device):
         if isinstance(device, str) and device.startswith("camera:"):
@@ -188,13 +223,18 @@ class Transfers:
         self.resume_records = None
         self.resume_seen = set()
         self.resume_pending = None
+        self.delete_tokens = {}
         try:
             self.jobs = json.loads(self.history_path.read_text())[-30:]
         except (OSError, ValueError):
             self.jobs = []
         interrupted = False
         for job in self.jobs:
-            if job["state"] in ACTIVE:
+            if job["state"] == "deleting":
+                job["state"] = job.pop("cleanup_previous_state", "complete")
+                job.setdefault("cleanup", {}).update(state="interrupted", error="Deletion interrupted. Recheck before trying again; no deletion resumes automatically.")
+                interrupted = True
+            elif job["state"] in ACTIVE:
                 job.update(state="interrupted", error="Service stopped. Originals and incomplete NAS folder retained. Use Resume when available.")
                 interrupted = True
         if interrupted:
@@ -218,6 +258,8 @@ class Transfers:
         with self.lock:
             positions = {j[0]["id"]: i + 1 for i, j in enumerate(self.queue)}
             return [dict(j, can_resume=bool(self.resume_mode(j)),
+                         can_delete=j["state"] in {"complete", "complete_with_skips"} and j["files"] > 0 and j.get("cleanup", {}).get("state") != "complete",
+                         can_organize=j["state"] in {"complete", "complete_with_skips"} and j.get("layout") != "camera_date",
                          queue_position=positions.get(j["id"], 0),
                          resume_needs_source=self.resume_mode(j) == "copy") for j in reversed(self.jobs)]
 
@@ -257,10 +299,11 @@ class Transfers:
         if not destination.startswith(prefix):
             raise ValueError("Invalid saved transfer destination")
         name = destination[len(prefix):]
-        match = re.fullmatch(r"(?:\.incomplete-|transfer-)([0-9]{8}-[0-9]{6}-[0-9a-f]{12})", name)
+        match = re.fullmatch(r"(?:\.incomplete-|transfer-|\.pitransfer-)([0-9]{8}-[0-9]{6}-[0-9a-f]{12})", name)
         if not match or match[1].rsplit("-", 1)[1] != job["id"]:
             raise ValueError("Invalid saved transfer folder")
-        return prefix, ".incomplete-" + match[1], "transfer-" + match[1]
+        return (prefix, ("transfer-" if job.get("legacy_workspace") else ".incomplete-") + match[1],
+                (".pitransfer-" if job.get("layout") == "camera_date" else "transfer-") + match[1])
 
     @classmethod
     def resume_mode(cls, job):
@@ -454,7 +497,11 @@ class Transfers:
                     visit(parent, names[-1], len(names) - 1)
         progress(totals)
 
-    def start(self, device, paths, estimate_id=None, destination_folder="", enqueue=False):
+    def start(self, device, paths, estimate_id=None, destination_folder="", enqueue=False, layout="original", import_timezone="UTC"):
+        from organize import timezone_name
+        if layout not in {"original", "camera_date"}:
+            raise ValueError("Invalid import layout")
+        timezone_name(import_timezone)
         paths = selection(device, paths)
         parts(destination_folder)
         estimate = None
@@ -479,6 +526,7 @@ class Transfers:
             try:
                 job = {"id": uuid.uuid4().hex[:12], "device": device, "state": "queued", "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": 0, "bytes": 0, "skipped": 0, "current": "", "destination": ""}
                 job["destination_folder"] = destination_folder
+                job.update(layout=layout, import_timezone=import_timezone)
                 job.update(paths=paths, resume_version=1, attempts=1, checked_bytes=0,
                            device_label=source["label"] if source else ("USB camera" if str(device).startswith("camera:") else "USB drive"),
                            device_node=source.get("node", "") if source else "",
@@ -498,6 +546,36 @@ class Transfers:
                 raise
         return dict(job)
 
+    def organize(self, job_id, import_timezone="UTC"):
+        from organize import timezone_name
+        timezone_name(import_timezone)
+        if not self.acquire_operation():
+            raise RuntimeError("Wait for the current drive operation to finish.")
+        try:
+            with self.lock:
+                job = next((j for j in self.jobs if j["id"] == job_id), None)
+                if not job or job["state"] not in {"complete", "complete_with_skips"} or job.get("layout") == "camera_date":
+                    raise ValueError("Choose a completed import that has not been organized yet")
+                self.destination_parts(job)
+                job.update(layout="camera_date", import_timezone=import_timezone, legacy_workspace=True,
+                           copy_complete=True, state="organizing", error="")
+                self.cancel_event.clear()
+                self.active_job = job
+                self.save()
+            threading.Thread(target=self.run, args=(job, [], True), daemon=True).start()
+            return dict(job)
+        except Exception:
+            self.release_operation(transfer=True)
+            raise
+
+    def prepare_delete(self, job_id, device=None):
+        from cleanup import prepare
+        return prepare(self, job_id, device)
+
+    def delete_verified(self, token, confirmation):
+        from cleanup import start
+        return start(self, token, confirmation)
+
     def cancel(self, job_id):
         with self.lock:
             for index, (job, _, _) in enumerate(self.queue):
@@ -512,7 +590,7 @@ class Transfers:
 
     def check(self):
         if self.cancel_event.is_set():
-            raise Cancelled("Transfer cancelled. Originals are unchanged; incomplete NAS folder retained.")
+            raise Cancelled("Operation cancelled. Verified NAS files are retained.")
 
     def update(self, job, **fields):
         with self.lock:
@@ -742,7 +820,11 @@ class Transfers:
                     if resuming:
                         self.resume_records, end = self.read_manifest(manifest, allow_tail=not job.get("copy_complete"))
                     if job.get("copy_complete"):
-                        self.verify_saved(data, self.resume_records, job)
+                        if job.get("layout") == "camera_date":
+                            from organize import publish
+                            publish(self, imports, dest, data, manifest, job)
+                        else:
+                            self.verify_saved(data, self.resume_records, job)
                     else:
                         if resuming:
                             manifest.seek(end)
@@ -796,6 +878,9 @@ class Transfers:
                         manifest.flush()
                         os.fsync(manifest.fileno())
                         self.checkpoint(job, copy_complete=True, pending_path=None, state="finalizing")
+                        if job.get("layout") == "camera_date":
+                            from organize import publish
+                            publish(self, imports, dest, data, manifest, job)
                 self.check()
                 self.update(job, state="finalizing", current="")
                 if not already_renamed:
@@ -806,7 +891,8 @@ class Transfers:
                     else:
                         raise FileExistsError("Final transfer folder appeared during copying; left unchanged.")
                     try:
-                        os.rename(incomplete, final, src_dir_fd=imports, dst_dir_fd=imports)
+                        from organize import rename_exclusive
+                        rename_exclusive(imports, incomplete, imports, final)
                     except PermissionError as exc:
                         raise RuntimeError("All files verified, but the NAS denied the final folder rename. Check NAS rename permissions, then Resume; no files need copying again.") from exc
                 self.update(job, state="complete_with_skips" if job["skipped"] else "complete", current="", destination=prefix + final)
@@ -991,7 +1077,7 @@ class Transfers:
             raise RuntimeError("Checksum mismatch: " + path)
         if times is not None:
             os.utime(name, ns=times, dir_fd=dest, follow_symlinks=False)
-        self.write_record(manifest, {"path": path, "size": copied, "sha256": digest.hexdigest(), "status": "verified"})
+        self.write_record(manifest, {"path": path, "size": copied, "sha256": digest.hexdigest(), "status": "verified", "source_mtime": times[1] / 1e9 if times else None})
         self.checkpoint(job, files=job["files"] + 1, state="copying", pending_path=None)
 
     @staticmethod

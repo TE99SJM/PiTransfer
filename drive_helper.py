@@ -1,12 +1,16 @@
 #!/usr/bin/python3
 """Narrow root helper. Installed root-owned; invoked with python3 -I."""
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
 import pwd
 import re
+import selectors
+import signal
 import stat
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -57,11 +61,11 @@ def validate_mount(device, target):
         raise RuntimeError("Source mount does not meet read-only requirements")
 
 
-def perform(action, token=None):
+def perform(action, token=None, request=None):
     devices = scan()
     if action == "list":
         return [{k: v for k, v in d.items() if k not in {"mounts", "major"}} for d in devices]
-    if action not in {"mount", "eject"} or not token or not re.fullmatch(r"[0-9]+:[0-9]+:[0-9a-f]{16}", token):
+    if action not in {"mount", "eject", "delete"} or not token or not re.fullmatch(r"[0-9]+:[0-9]+:[0-9a-f]{16}", token):
         raise ValueError("Invalid operation")
     device = next((d for d in devices if d["id"] == token), None)
     if not device or not device["usable"]:
@@ -97,7 +101,120 @@ def perform(action, token=None):
         mount_type = "ntfs-3g" if fs == "ntfs" else fs
         command(["/usr/bin/mount", "-t", mount_type, "-o", options, "--", node, str(target)])
         validate_mount(device, target)
+    if action == "delete":
+        return delete_file(device, target, request)
     return {"path": str(target)}
+
+
+DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def relative(path):
+    if not isinstance(path,str) or len(path)>4096 or not path or '\x00' in path:
+        raise ValueError('Invalid deletion path')
+    names=path.split('/')
+    if any(n in ('','.','..') for n in names): raise ValueError('Invalid deletion path')
+    return names
+
+
+@contextlib.contextmanager
+def parent_directory(root,names):
+    fd=os.dup(root)
+    try:
+        for name in names[:-1]:
+            child=os.open(name,DIRECTORY,dir_fd=fd);os.close(fd);fd=child
+        yield fd
+    finally: os.close(fd)
+
+
+def signature(info):
+    return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns)
+
+
+def fresh_hash(fd,check,emit):
+    before=os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:
+        raise ValueError('Deletion requires regular files without hard links')
+    digest=hashlib.sha256();count=0;last=0;pending=0
+    while True:
+        check()
+        chunk=os.read(fd,1024*1024)
+        if not chunk: break
+        digest.update(chunk);count+=len(chunk);pending+=len(chunk)
+        if time.monotonic()-last>=.2:
+            emit({'bytes':pending});pending=0;last=time.monotonic()
+    if pending: emit({'bytes':pending})
+    if signature(before)!=signature(os.fstat(fd)) or count!=before.st_size:
+        raise RuntimeError('File changed during verification; original was kept')
+    return (count,digest.hexdigest()),before
+
+
+def nas_root(config):
+    target=config['nas_mount']
+    data=json.loads(command(['/usr/bin/findmnt','-J','-M',target,'-o','TARGET,FSTYPE,OPTIONS,SOURCE']))['filesystems'][0]
+    options=set(data['options'].split(','))
+    if (data['target']!=target or data['fstype']!='cifs' or data['source']!=config['nas_share']
+            or not {'rw','seal','cache=none'}.issubset(options) or not any(o.startswith('vers=3') for o in options)):
+        raise RuntimeError('The configured encrypted NAS is not mounted; originals were kept')
+    fd=os.open(target,DIRECTORY)
+    if not os.path.ismount(target) or os.fstat(fd).st_dev!=os.stat(target).st_dev:
+        os.close(fd);raise RuntimeError('NAS mount changed')
+    return fd
+
+
+def delete_file(device,target,request,config_path='/etc/pi-nas-drop/config.json',emit=None,confirm=None,check=None):
+    """Hash both files while RO, authorize, unlink one, restore RO even on errors."""
+    emit=emit or (lambda result: print(json.dumps(result),flush=True))
+    confirm=confirm or (lambda: json.loads(sys.stdin.buffer.readline(1024)))
+    def connected():
+        with selectors.DefaultSelector() as selector:
+            selector.register(sys.stdin,selectors.EVENT_READ)
+            if selector.select(0):
+                raise RuntimeError('Deletion cancelled before authorization')
+    check=check or connected
+    if (not isinstance(request,dict) or type(request.get('size')) is not int or request['size']<0
+            or not isinstance(request.get('sha256'),str) or not re.fullmatch('[0-9a-f]{64}',request['sha256'])):
+        raise ValueError('Invalid verification receipt')
+    names=relative(request.get('path'));backup=relative(request.get('backup_path'))
+    expected=request['size'],request['sha256']
+    config=json.loads(Path(config_path).read_text())
+    validate_mount(device,target)
+    rw_attempted=False
+    try:
+        with contextlib.ExitStack() as stack:
+            src=os.open(target,DIRECTORY);stack.callback(os.close,src)
+            nas=nas_root(config);stack.callback(os.close,nas)
+            source_parent=stack.enter_context(parent_directory(src,names))
+            backup_parent=stack.enter_context(parent_directory(nas,backup))
+            source=os.open(names[-1],READ,dir_fd=source_parent);stack.callback(os.close,source)
+            dest=os.open(backup[-1],READ,dir_fd=backup_parent);stack.callback(os.close,dest)
+            source_hash,before=fresh_hash(source,check,emit)
+            if source_hash!=expected: raise RuntimeError('Original changed; it was kept')
+            backup_hash,saved=fresh_hash(dest,check,emit)
+            if backup_hash!=expected: raise RuntimeError('NAS checksum changed; original was kept')
+            check();emit({'ready':True})
+            if confirm()!={'delete':True}: raise ValueError('Deletion was not confirmed')
+            if (signature(os.stat(backup[-1],dir_fd=backup_parent,follow_symlinks=False))!=signature(saved)
+                    or signature(os.fstat(dest))!=signature(saved)):
+                raise RuntimeError('NAS copy changed after verification; original was kept')
+            rw_attempted=True
+            try:
+                command(['/usr/bin/mount','-o','remount,rw,nosuid,nodev,noexec','--',str(target)])
+                if signature(os.stat(names[-1],dir_fd=source_parent,follow_symlinks=False))!=signature(before):
+                    raise RuntimeError('Original changed after verification; it was kept')
+                os.unlink(names[-1],dir_fd=source_parent)
+                os.fsync(source_parent)
+            finally:
+                # Do not leave a source writable after an error or cancellation.
+                command(['/usr/bin/mount','-o','remount,ro,nosuid,nodev,noexec','--',str(target)])
+                validate_mount(device,target)
+                rw_attempted=False
+    finally:
+        if rw_attempted:
+            # All handles are now closed. Fail closed if restoring RO failed.
+            command(['/usr/bin/umount','--',str(target)])
+    return {'deleted':True}
 
 
 if __name__ == "__main__":
@@ -106,7 +223,15 @@ if __name__ == "__main__":
             raise ValueError("This helper requires the installed sudo rule")
         with open("/run/pi-nas-drop-helper.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            print(json.dumps(perform(*sys.argv[1:])))
+            if sys.argv[1] == 'delete':
+                def interrupted(signum, frame):
+                    raise RuntimeError('Deletion interrupted; restoring source protection')
+                signal.signal(signal.SIGTERM, interrupted)
+                signal.signal(signal.SIGINT, interrupted)
+                request=json.loads(sys.stdin.buffer.readline(16385))
+                print(json.dumps(perform(*sys.argv[1:],request=request)),flush=True)
+            else:
+                print(json.dumps(perform(*sys.argv[1:])))
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

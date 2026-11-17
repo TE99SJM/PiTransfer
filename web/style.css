@@ -5,3 +5,5 @@
 .nas-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:flex-end}.nas-browser{margin-bottom:20px}.nas-folders{max-height:280px;overflow:auto;margin:10px 0;border-top:1px solid var(--line)}.nas-folder-name{flex:1;min-width:0;overflow-wrap:anywhere;font-size:13px}.nas-browser>p.muted{font-size:12px;margin:10px 0 0}@media(max-width:600px){.nas{flex-direction:column}.nas-actions{justify-content:flex-start}.size-summary strong{font-size:13px}}
 
 .progress-heading{display:flex;justify-content:space-between;gap:12px;margin-top:14px;font-size:13px}.progress-heading strong{font-weight:650}.progress-heading span{font-variant-numeric:tabular-nums;white-space:nowrap}.job .transfer-progress{height:16px;border-radius:8px;overflow:hidden;margin:8px 0}.job .progress-detail{margin-bottom:12px}.job .pill.starting,.job .pill.counting,.job .pill.resuming,.job .pill.finalizing{background:#fff3d8;color:#83601b}.job-top strong{overflow-wrap:anywhere;min-width:0}
+
+.job .pill.organizing,.job .pill.deleting{background:#fff3d8;color:#83601b}.job>button{margin:6px 8px 0 0}.cleanup-error{color:var(--danger)}

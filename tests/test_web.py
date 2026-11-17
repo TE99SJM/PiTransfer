@@ -121,7 +121,7 @@ class WebTest(unittest.TestCase):
                 time.sleep(.005)
         job = self.app.transfers.snapshot()[0]
         self.assertEqual(job['state'], 'complete')
-        self.assertEqual((self.app.hardware.dst/job['destination']/'data/file.txt').read_bytes(), b'copy in background')
+        self.assertEqual((self.app.hardware.dst/job['output_folders'][0]/'file.txt').read_bytes(), b'copy in background')
 
     def test_resume_requires_login_csrf_and_saved_job_identifier(self):
         from unittest.mock import patch
@@ -143,7 +143,7 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.request('/api/queue', 'POST', payload, HTTP_X_CSRF_TOKEN='wrong')['status'], 403)
             start.assert_not_called()
             self.assertEqual(self.request('/api/queue', 'POST', payload)['status'], 200)
-            start.assert_called_once_with('usb', [''], destination_folder='Video', enqueue=True)
+            start.assert_called_once_with('usb', [''], destination_folder='Video', enqueue=True, layout='camera_date', import_timezone='UTC')
 
     def test_rate_limit_and_wrong_password(self):
         # Use a stub digest to keep repeated brute-force rejection testing quick.
@@ -169,6 +169,22 @@ class WebTest(unittest.TestCase):
     def test_secure_cookie_mode(self):
         self.app.config['secure_cookie'] = True
         self.assertIn('; Secure', self.login()['headers']['Set-Cookie'])
+
+    def test_organize_and_delete_require_login_csrf_and_confirmation(self):
+        for endpoint,payload,method,args in (
+            ('/api/organize',{'id':'job','import_timezone':'America/Chicago'},'organize',('job','America/Chicago')),
+            ('/api/delete/prepare',{'id':'job','device':'usb'},'prepare_delete',('job','usb')),
+            ('/api/delete/confirm',{'token':'nonce','confirmation':'DELETE 2'},'delete_verified',('nonce','DELETE 2'))):
+            from unittest.mock import patch
+            self.cookie='';self.csrf=''
+            with patch.object(self.app.transfers,method,return_value={'ok':True}) as action:
+                self.assertEqual(self.request(endpoint,'POST',payload)['status'],401)
+                self.login()
+                self.assertEqual(self.request(endpoint,'POST',payload,HTTP_X_CSRF_TOKEN='bad')['status'],403)
+                self.assertEqual(self.request(endpoint,'GET')['status'],404)
+                action.assert_not_called()
+                self.assertEqual(self.request(endpoint,'POST',payload)['status'],200)
+                action.assert_called_once_with(*args)
 
 
 if __name__ == '__main__':

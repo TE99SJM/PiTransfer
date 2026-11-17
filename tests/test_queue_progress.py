@@ -160,12 +160,13 @@ class QueueProgressTest(unittest.TestCase):
     def test_recheck_progress_moves_inside_large_file(self):
         payload = b'x' * 3000000
         (self.hw.src/'big').write_bytes(payload)
-        rename = os.rename
-        def fail(src, dst, **kwargs):
+        from organize import rename_exclusive
+        rename = rename_exclusive
+        def fail(src_fd, src, dst_fd, dst):
             if str(src).startswith('.incomplete-'):
                 raise PermissionError('test rename failure')
-            return rename(src,dst,**kwargs)
-        with patch('core.os.rename', side_effect=fail):
+            return rename(src_fd,src,dst_fd,dst)
+        with patch('organize.rename_exclusive', side_effect=fail):
             job = self.engine.start('usb', ['big'])
             self.wait()
         changes = []

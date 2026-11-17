@@ -126,11 +126,17 @@ class App:
         if (method, path) == ("POST", "/api/browse"):
             return self.transfers.browse(data["device"], data.get("path", ""), int(data.get("offset", 0)))
         if (method, path) == ("POST", "/api/transfer"):
-            return self.transfers.start(data["device"], data["paths"], data.get("estimate_id"), data.get("destination_folder", ""))
+            return self.transfers.start(data["device"], data["paths"], data.get("estimate_id"), data.get("destination_folder", ""), layout=data.get("layout", "camera_date"), import_timezone=data.get("import_timezone", "UTC"))
+        if (method, path) == ("POST", "/api/organize"):
+            return self.transfers.organize(data["id"], data.get("import_timezone", "UTC"))
+        if (method, path) == ("POST", "/api/delete/prepare"):
+            return self.transfers.prepare_delete(data["id"], data.get("device"))
+        if (method, path) == ("POST", "/api/delete/confirm"):
+            return self.transfers.delete_verified(data["token"], data["confirmation"])
         if (method, path) == ("POST", "/api/resume"):
             return self.transfers.resume(data["id"], data.get("device"))
         if (method, path) == ("POST", "/api/queue"):
-            return self.transfers.start(data["device"], [""], destination_folder=data.get("destination_folder", ""), enqueue=True)
+            return self.transfers.start(data["device"], [""], destination_folder=data.get("destination_folder", ""), enqueue=True, layout=data.get("layout", "camera_date"), import_timezone=data.get("import_timezone", "UTC"))
         if (method, path) == ("POST", "/api/eject"):
             return self.transfers.eject(data["device"])
         if (method, path) == ("POST", "/api/cancel"):

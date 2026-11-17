@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from camera_worker import download, entries, file_info, estimate, detect_ports
+from camera_worker import download, entries, file_info, estimate, detect_ports, delete_verified
 
 try:
     import gphoto2 as gp
@@ -104,3 +104,28 @@ class NativeCameraTest(unittest.TestCase):
         gc.collect()
         self.assertEqual([ports[i].get_path() for i in range(ports.count())], expected)
         self.assertEqual(detect_ports(gp, only='usb:999,999'), [])
+
+    def test_native_delete_requires_handshake_and_stable_object(self):
+        payload=b'original video bytes'
+        target=self.root/'clip.MP4';target.write_bytes(payload)
+        expected=file_info(gp,self.camera,'clip.MP4')
+        with tempfile.TemporaryFile(mode='w+b') as output:
+            import io
+            text=io.TextIOWrapper(output,encoding='utf-8',write_through=True)
+            try:
+                with patch('camera_worker.sys.stdout',text):
+                    with self.assertRaises(ValueError):
+                        delete_verified(gp,self.camera,'clip.MP4',expected,lambda:{'delete':False})
+                self.assertEqual(target.read_bytes(),payload)
+                output.seek(0);output.truncate()
+                def approved():
+                    text.flush();output.seek(0);received=output.read()
+                    self.assertTrue(received.startswith(payload),received)
+                    self.assertIn(b'"ready": true',received)
+                    output.seek(0,2)
+                    return {'delete':True}
+                with patch('camera_worker.sys.stdout',text):
+                    delete_verified(gp,self.camera,'clip.MP4',expected,approved)
+                self.assertFalse(target.exists())
+            finally:
+                text.detach()

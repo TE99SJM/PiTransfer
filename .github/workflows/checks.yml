@@ -18,7 +18,7 @@ jobs:
       - name: Run transfer and security tests
         run: python3 -m unittest discover -s tests -v
       - name: Check Python syntax
-        run: python3 -m compileall -q app.py core.py drive_helper.py camera.py camera_worker.py setup_config.py
+        run: python3 -m compileall -q app.py core.py drive_helper.py camera.py camera_worker.py organize.py metadata_worker.py cleanup.py setup_config.py
       - name: Check installer syntax
         run: bash -n install.sh update.sh
       - name: Check browser JavaScript syntax
@@ -26,11 +26,11 @@ jobs:
       - name: Install distro camera bindings
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-gphoto2
+          sudo apt-get install -y --no-install-recommends python3-gphoto2 libimage-exiftool-perl ffmpeg
       - name: Check native camera streaming
         run: |
           /usr/bin/python3 -c 'import gphoto2'
-          /usr/bin/python3 -m unittest tests.test_camera_native -v
+          /usr/bin/python3 -m unittest tests.test_camera_native tests.test_organize -v
       - name: Install browser test tools
         run: |
           python3 -m pip install playwright==1.62.0

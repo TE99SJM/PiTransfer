@@ -1,5 +1,6 @@
 """Camera metadata and bounded streams; native USB code stays out of the server."""
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -116,3 +117,38 @@ class CameraSource:
 
     def stream(self, path, expected, check):
         return self.backend.stream(self.device, path, expected, check)
+
+    def delete_verified(self, path, record, verify_backup, check, progress):
+        expected = self.stat(path)
+        if expected['kind'] != 'file' or expected.get('size') not in (None, record['size']):
+            raise RuntimeError('Original file changed; it was kept: ' + path)
+        request = dict(action='delete_verified',device=self.device,path=path,expected=expected)
+        process = subprocess.Popen(self.backend.command,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        remaining=record['size'];digest=hashlib.sha256();pending=b'';ready=False;deleted=False
+        try:
+            process.stdin.write((json.dumps(request)+'\n').encode());process.stdin.flush()
+            for chunk in self.backend._chunks(process,lambda: None if ready else check()):
+                if remaining:
+                    data,chunk=chunk[:remaining],chunk[remaining:]
+                    digest.update(data);remaining-=len(data);progress(len(data))
+                pending+=chunk
+                while b'\n' in pending:
+                    line,pending=pending.split(b'\n',1)
+                    response=json.loads(line)
+                    if response=={'ready':True} and not ready and not remaining:
+                        if digest.hexdigest()!=record['sha256']:
+                            raise RuntimeError('Original checksum changed; file was kept: '+path)
+                        verify_backup();check()
+                        process.stdin.write(b'{"delete":true}\n');process.stdin.flush();process.stdin.close()
+                        ready=True
+                    elif response=={'deleted':True} and ready and not deleted:
+                        deleted=True
+                    else:
+                        raise ValueError('Invalid verified deletion response')
+                if len(pending)>65536: raise ValueError('Invalid verified deletion response')
+            if remaining or pending or not deleted:
+                raise RuntimeError('Original deletion was not acknowledged; check the source before retrying')
+        finally:
+            if process.poll() is None: process.kill()
+            process.wait()
+            for pipe in (process.stdin,process.stdout,process.stderr): pipe.close()

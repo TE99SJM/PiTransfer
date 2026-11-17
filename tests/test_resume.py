@@ -59,13 +59,14 @@ class ResumeTest(unittest.TestCase):
         return job
 
     def rename_failure(self, legacy=False):
-        rename = os.rename
-        def deny(src, dst, **kwargs):
+        from organize import rename_exclusive
+        rename = rename_exclusive
+        def deny(src_fd, src, dst_fd, dst):
             if str(src).startswith('.incomplete-'):
                 # Reproduce the SMB final-rename permission error.
                 raise PermissionError(errno.EACCES, 'Permission denied', src, None, dst)
-            return rename(src, dst, **kwargs)
-        with patch('core.os.rename', side_effect=deny):
+            return rename(src_fd, src, dst_fd, dst)
+        with patch('organize.rename_exclusive', side_effect=deny):
             self.engine.start('usb', ['first', 'second'])
             job = self.wait()
         self.assertEqual(job['state'], 'failed', job)
@@ -146,9 +147,10 @@ class ResumeTest(unittest.TestCase):
                 self.engine.save()
 
     def test_finalization_closes_child_handles_before_rename(self):
-        rename = os.rename
+        from organize import rename_exclusive
+        rename = rename_exclusive
         checked = []
-        def check(src, dst, **kwargs):
+        def check(src_fd, src, dst_fd, dst):
             if str(src).startswith('.incomplete-'):
                 opened = []
                 for fd in Path('/proc/self/fd').iterdir():
@@ -158,8 +160,8 @@ class ResumeTest(unittest.TestCase):
                         pass
                 self.assertFalse(any('/'+src in path for path in opened), opened)
                 checked.append(True)
-            return rename(src, dst, **kwargs)
-        with patch('core.os.rename', side_effect=check):
+            return rename(src_fd, src, dst_fd, dst)
+        with patch('organize.rename_exclusive', side_effect=check):
             self.engine.start('usb', ['first'])
             result = self.wait()
         self.assertEqual(result['state'], 'complete', result)
