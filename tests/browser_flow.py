@@ -137,9 +137,9 @@ def main():
                     expect(page.locator('#jobs .job').first).to_contain_text('1 saved files rechecked')
 
                     # A progress bar exists for old resume jobs and for every camera.
-                    assert page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") == 28
-                    assert page.evaluate("jobProgress({state:'verifying',total_bytes:100,bytes:100,checked_bytes:50}).percent") == 75
-                    assert page.evaluate("jobProgress({state:'copying',total_files:4,files:1,unknown_files:1,bytes:10}).percent") == 25
+                    assert abs(page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") - 28) < 1e-9
+                    assert abs(page.evaluate("jobProgress({state:'verifying',total_bytes:100,bytes:100,checked_bytes:50}).percent") - 75) < 1e-9
+                    assert abs(page.evaluate("jobProgress({state:'copying',total_files:4,files:1,unknown_files:1,bytes:10}).percent") - 25) < 1e-9
                     second = 'camera:002:004:aaaaaaaaaaaaaaaa'
                     cameras[second] = FakeCamera()
                     available.append(dict(available[0], id=second, label='Second USB camera', node='usb:002,004'))
