@@ -127,6 +127,8 @@ class App:
             return self.transfers.browse(data["device"], data.get("path", ""), int(data.get("offset", 0)))
         if (method, path) == ("POST", "/api/transfer"):
             return self.transfers.start(data["device"], data["paths"], data.get("estimate_id"), data.get("destination_folder", ""))
+        if (method, path) == ("POST", "/api/resume"):
+            return self.transfers.resume(data["id"], data.get("device"))
         if (method, path) == ("POST", "/api/eject"):
             return self.transfers.eject(data["device"])
         if (method, path) == ("POST", "/api/cancel"):

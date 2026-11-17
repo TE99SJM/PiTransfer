@@ -3,10 +3,13 @@
 Run explicitly with Playwright/Chromium installed. Never connects to real hardware.
 """
 from pathlib import Path
+import errno
+import os
 import sys
 import tempfile
 import threading
 import time
+from unittest.mock import patch
 from wsgiref.simple_server import make_server, WSGIRequestHandler
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -98,11 +101,43 @@ def main():
                     expect(page.locator('#size-detail')).to_contain_text('cancelled', timeout=15000)
                     expect(page.locator('#check-size')).to_be_enabled()
 
+                    # Reproduce the older install's final SMB rename failure.
+                    rename = os.rename
+                    def deny_rename(src, dst, **kwargs):
+                        if str(src).startswith('.incomplete-'):
+                            raise PermissionError(errno.EACCES, 'Permission denied', src, None, dst)
+                        return rename(src, dst, **kwargs)
+                    with patch('core.os.rename', side_effect=deny_rename):
+                        application.transfers.start(DEVICE, ['note.txt'])
+                        deadline = time.monotonic() + 5
+                        while time.monotonic() < deadline:
+                            if application.transfers.operation.acquire(False):
+                                application.transfers.operation.release()
+                                break
+                            time.sleep(.01)
+                    failed = application.transfers.jobs[-1]
+                    assert failed['state'] == 'failed', failed
+                    _, incomplete, final = application.transfers.destination_parts(failed)
+                    for key in ('copy_complete', 'paths', 'resume_version', 'pending_path'):
+                        failed.pop(key, None)
+                    failed['error'] = str(PermissionError(errno.EACCES, 'Permission denied', incomplete, None, final))
+                    application.transfers.save()
+                    downloads = list(camera.opened)
+                    page.get_by_role('button', name='Refresh', exact=True).click()
+                    expect(page.locator('#jobs .job-top .pill').first).to_have_text('failed')
+                    expect(page.get_by_role('button', name='Resume transfer', exact=True)).to_be_enabled()
+                    page.once('dialog', lambda dialog: dialog.accept())
+                    page.get_by_role('button', name='Resume transfer', exact=True).click()
+                    expect(page.locator('#notice')).to_contain_text('Resume started on the Pi')
+                    expect(page.locator('#jobs .job-top .pill').first).to_have_text('complete', timeout=15000)
+                    assert camera.opened == downloads, 'Finalization downloaded the camera files again'
+                    expect(page.locator('#jobs .job').first).to_contain_text('1 saved files rechecked')
+
                     page.set_viewport_size({"width":390,"height":844})
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'
                     assert not errors, errors
                     browser.close()
-                    print('Browser checks passed: NAS folders, size totals, unknown sizes, cancel, copy confirmation, destination, and mobile width.')
+                    print('Browser checks passed: NAS folders, size totals, unknown sizes, cancel, copy confirmation, destination, legacy failed-transfer resume without another download, and mobile width.')
             finally:
                 server.shutdown()
 

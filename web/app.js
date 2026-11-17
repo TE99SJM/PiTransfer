@@ -4,7 +4,7 @@ let csrf = '', device = null, currentPath = '', offset = 0, nasReady = false, bu
 let selected = new Set(), devices = [];
 let sizing = false, serverSizing = false, preparing = false, sizeResult = null, sizeKey = '', sizeJobId = null, nasFree = null;
 let nasShare = '', nasFolder = '', nasBrowsePath = '', nasOffset = 0, nasLoading = false;
-const activeStates = new Set(['queued', 'copying', 'verifying']);
+const activeStates = new Set(['queued', 'copying', 'verifying', 'resuming', 'finalizing']);
 const sizeStates = new Set(['queued', 'counting']);
 function node(tag, text, cls) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -37,6 +37,7 @@ function controls() {
   for (const input of $('files').querySelectorAll('input')) input.disabled = blocked || input.dataset.unsupported === 'true';
   for (const b of $('files').querySelectorAll('button')) b.disabled = blocked;
   for (const b of $('drives').querySelectorAll('button')) b.disabled = blocked || b.dataset.usable === 'false';
+  for (const b of $('jobs').querySelectorAll('.resume-transfer')) b.disabled = blocked || !nasReady;
 }
 function invalidateSize() {
   sizeResult = null; sizeKey = '';
@@ -151,6 +152,7 @@ function renderJobs(jobs) {
     const row=node('div',undefined,'job'), top=node('div',undefined,'job-top');
     const date=new Date(j.created).toLocaleString();top.append(node('strong',date),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
     row.append(node('p',`${j.files} files verified · ${bytes(j.bytes)} copied${j.skipped ? ' · '+j.skipped+' skipped':''}`));
+    if(j.reused_files) row.append(node('p',`${j.reused_files} saved files rechecked · ${bytes(j.reused_bytes)} reused`));
     if(Number.isFinite(j.total_bytes)) {
       row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
       if(!j.unknown_files && j.total_bytes > 0) {
@@ -159,8 +161,27 @@ function renderJobs(jobs) {
     }
     if(j.current)row.append(node('p',j.current,'path'));if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
     if(activeStates.has(j.state))row.append(button('Cancel transfer',async()=>{await api('cancel',{id:j.id});notice('Cancellation requested. Waiting for the current disk operation to return.');},'danger'));
+    if(j.can_resume) {
+      row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
+      row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
+    } else if(['failed','cancelled','interrupted'].includes(j.state)) {
+      row.append(node('p','This older transfer has no saved selection for resuming. Its NAS files are retained.'));
+    }
     $('jobs').append(row);
   }controls();
+}
+async function resumeTransfer(job) {
+  preparing=true;controls();
+  try {
+    const source=job.resume_needs_source?(device || job.device):null;
+    if(job.resume_needs_source && !devices.some(d=>d.id===source && d.usable)) throw new Error('Reconnect and select the original camera or drive, then press Resume transfer.');
+    const name=devices.find(d=>d.id===source)?.label || 'source';
+    const message=job.resume_needs_source?`Resume using ${name}? Make sure this is the original camera/card. Saved files are checked against the source and NAS before reuse. Any unfinished file restarts from its beginning.`:'Recheck the saved NAS files and finish this transfer? No files will be downloaded from the camera or drive again.';
+    if(!confirm(message+'\nThe existing transfer folder will be reused.')) return;
+    await api('resume',{id:job.id,device:source});
+    notice('Resume started on the Pi. You can close this window and check progress later.');
+    await refresh();
+  } finally {preparing=false;controls();}
 }
 async function refresh() {
   const s=await api('status');devices=s.devices;nasReady=s.nas.ready;

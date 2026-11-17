@@ -122,6 +122,18 @@ class WebTest(unittest.TestCase):
         job = self.app.transfers.snapshot()[0]
         self.assertEqual(job['state'], 'complete')
         self.assertEqual((self.app.hardware.dst/job['destination']/'data/file.txt').read_bytes(), b'copy in background')
+
+    def test_resume_requires_login_csrf_and_saved_job_identifier(self):
+        from unittest.mock import patch
+        payload = {'id':'saved-job', 'device':'usb'}
+        with patch.object(self.app.transfers, 'resume', return_value={'id':'saved-job', 'state':'queued'}) as resume:
+            self.assertEqual(self.request('/api/resume', 'POST', payload)['status'], 401)
+            self.login()
+            self.assertEqual(self.request('/api/resume', 'POST', payload, HTTP_X_CSRF_TOKEN='wrong')['status'], 403)
+            resume.assert_not_called()
+            self.assertEqual(self.request('/api/resume', 'POST', payload)['status'], 200)
+            resume.assert_called_once_with('saved-job', 'usb')
+
     def test_rate_limit_and_wrong_password(self):
         # Use a stub digest to keep repeated brute-force rejection testing quick.
         from unittest.mock import patch

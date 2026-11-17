@@ -18,7 +18,8 @@ CHUNK = 1024 * 1024
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-ACTIVE = {"queued", "copying", "verifying"}
+ACTIVE = {"queued", "copying", "verifying", "resuming", "finalizing"}
+RETRYABLE = {"failed", "cancelled", "interrupted"}
 ESTIMATING = {"queued", "counting"}
 
 
@@ -181,6 +182,9 @@ class Transfers:
         self.device_cache_time = 0
         self.size_job = None
         self.size_cancel = threading.Event()
+        self.resume_records = None
+        self.resume_seen = set()
+        self.resume_pending = None
         try:
             self.jobs = json.loads(self.history_path.read_text())[-30:]
         except (OSError, ValueError):
@@ -188,7 +192,7 @@ class Transfers:
         interrupted = False
         for job in self.jobs:
             if job["state"] in ACTIVE:
-                job.update(state="interrupted", error="Service stopped. Originals are unchanged; incomplete NAS folder retained. Start a new copy.")
+                job.update(state="interrupted", error="Service stopped. Originals and incomplete NAS folder retained. Use Resume when available.")
                 interrupted = True
         if interrupted:
             self.save()
@@ -196,12 +200,85 @@ class Transfers:
     def save(self):
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.history_path.with_suffix(".tmp")
-        temp.write_text(json.dumps(self.jobs, ensure_ascii=True))
+        with temp.open("w") as output:
+            json.dump(self.jobs, output, ensure_ascii=True)
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(temp, self.history_path)
+        fd = os.open(self.history_path.parent, DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def snapshot(self):
         with self.lock:
-            return [dict(j) for j in reversed(self.jobs)]
+            return [dict(j, can_resume=bool(self.resume_mode(j)),
+                         resume_needs_source=self.resume_mode(j) == "copy") for j in reversed(self.jobs)]
+
+    @staticmethod
+    def destination_parts(job):
+        folder = job.get("destination_folder", "")
+        parts(folder)
+        prefix = (folder + "/" if folder else "") + "Pi-Imports/"
+        destination = job.get("destination", "")
+        if not destination.startswith(prefix):
+            raise ValueError("Invalid saved transfer destination")
+        name = destination[len(prefix):]
+        match = re.fullmatch(r"(?:\.incomplete-|transfer-)([0-9]{8}-[0-9]{6}-[0-9a-f]{12})", name)
+        if not match or match[1].rsplit("-", 1)[1] != job["id"]:
+            raise ValueError("Invalid saved transfer folder")
+        return prefix, ".incomplete-" + match[1], "transfer-" + match[1]
+
+    @classmethod
+    def resume_mode(cls, job):
+        if job.get("state") not in RETRYABLE:
+            return None
+        if job.get("copy_complete"):
+            return "finalize"
+        # Older versions did not save selections. Recover only their explicit
+        # final-rename failure, never infer a partial selection from copied files.
+        try:
+            _, incomplete, final = cls.destination_parts(job)
+            if (job.get("state") == "failed" and not job.get("paths")
+                    and f"{incomplete!r} -> {final!r}" in job.get("error", "")):
+                return "finalize"
+        except (ValueError, KeyError, TypeError):
+            pass
+        return "copy" if job.get("resume_version") == 1 and job.get("paths") else None
+
+    def resume(self, job_id, device=None):
+        if not self.operation.acquire(blocking=False):
+            raise RuntimeError("Wait for the current drive operation to finish.")
+        try:
+            with self.lock:
+                job = next((j for j in self.jobs if j["id"] == job_id), None)
+                mode = self.resume_mode(job or {})
+                if not mode:
+                    raise ValueError("This transfer has no safe resume checkpoint.")
+                if mode == "copy":
+                    device = device or job["device"]
+                    if not isinstance(device, str) or device.startswith("camera:") != job["device"].startswith("camera:"):
+                        raise ValueError("Select the same kind of source used for this transfer.")
+                    paths = selection(device, job["paths"])
+                else:
+                    paths = []
+                # Validate history before changing the saved job.
+                if job.get("destination"):
+                    self.destination_parts(job)
+                job.update(state="queued", error="", resumed_at=time.time(),
+                           attempts=job.get("attempts", 1) + 1)
+                if mode == "finalize":
+                    job["copy_complete"] = True
+                else:
+                    job["device"] = device
+                self.cancel_event.clear()
+                self.save()
+            threading.Thread(target=self.run, args=(job, paths, True), daemon=True).start()
+        except Exception:
+            self.operation.release()
+            raise
+        return dict(job)
 
     def devices(self):
         # Discovery must not contend with a camera copy or metadata session.
@@ -348,6 +425,7 @@ class Transfers:
             with self.lock:
                 job = {"id": uuid.uuid4().hex[:12], "device": device, "state": "queued", "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": 0, "bytes": 0, "skipped": 0, "current": "", "destination": ""}
                 job["destination_folder"] = destination_folder
+                job.update(paths=paths, resume_version=1, attempts=1)
                 if estimate:
                     job.update(total_bytes=estimate["bytes"], total_files=estimate["files"],
                                unknown_files=estimate["unknown_files"])
@@ -374,20 +452,155 @@ class Transfers:
         with self.lock:
             job.update(fields)
 
-    def run(self, job, paths):
+    def checkpoint(self, job, **fields):
+        with self.lock:
+            job.update(fields)
+            self.save()
+
+    def make_folder(self, parent, name):
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+        except FileExistsError:
+            if self.resume_records is None:
+                raise
+            # The caller opens it with O_DIRECTORY | O_NOFOLLOW next.
+
+    def read_manifest(self, manifest, allow_tail=False):
+        records, end = {}, 0
+        while True:
+            self.check()
+            line = manifest.readline(65537)
+            if not line:
+                break
+            if len(line) > 65536 or manifest.tell() > 64 * 1024 * 1024 or len(records) >= 100000:
+                raise ValueError("Resume manifest exceeds supported limits (64 MiB / 100,000 entries).")
+            if not line.endswith(b"\n"):
+                if not allow_tail:
+                    raise ValueError("Incomplete verification manifest; cannot finalize this transfer.")
+                break
+            record = json.loads(line)
+            path = record.get("path")
+            if not parts(path) or path in records:
+                raise ValueError("Invalid or duplicate path in verification manifest")
+            if record.get("status") == "verified":
+                if (type(record.get("size")) is not int or record["size"] < 0
+                        or not isinstance(record.get("sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])):
+                    raise ValueError("Invalid verification record")
+            elif record.get("status") != "skipped":
+                raise ValueError("Invalid verification record")
+            records[path] = record
+            end = manifest.tell()
+        return records, end
+
+    def hash_file(self, parent, name):
+        digest, size = hashlib.sha256(), 0
+        with os.fdopen(os.open(name, READ, dir_fd=parent), "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("Resume requires a regular file")
+            while True:
+                self.check()
+                chunk = source.read(CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+            after = os.fstat(source.fileno())
+            if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                raise RuntimeError("File changed during resume verification")
+        return size, digest.hexdigest()
+
+    def verified_record(self, path):
+        record = (self.resume_records or {}).get(path)
+        if record and record["status"] != "verified":
+            raise RuntimeError("Source item changed type since the previous attempt: " + path)
+        return record
+
+    def reuse(self, dest, name, path, record, source_hash, job):
+        expected = (record["size"], record["sha256"])
+        if source_hash != expected:
+            raise RuntimeError("Source no longer matches the saved transfer. Select the original camera/card: " + path)
+        if self.hash_file(dest, name) != expected:
+            raise RuntimeError("Saved NAS file is missing or changed; it was not overwritten: " + path)
+        self.resume_seen.add(path)
+        self.update(job, files=job["files"] + 1, bytes=job["bytes"] + record["size"],
+                    reused_files=job["reused_files"] + 1, reused_bytes=job["reused_bytes"] + record["size"])
+
+    def prepare_file(self, dest, name, path, job):
+        if self.resume_records is not None:
+            try:
+                existing = os.stat(name, dir_fd=dest, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing:
+                if path != self.resume_pending or not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                    raise RuntimeError("Unexpected file in the incomplete transfer; left unchanged: " + path)
+                # Only the recorded unfinished file belongs to this retry.
+                # Unlink rather than truncate so a hard-link target cannot be changed.
+                os.unlink(name, dir_fd=dest)
+            self.resume_seen.add(path)
+        self.checkpoint(job, current=path, pending_path=path, state="copying")
+
+    def verify_saved(self, data, records, job):
+        expected = (job["files"], job["bytes"], job["skipped"])
+        files = total = skipped = 0
+        self.update(job, state="resuming", reused_files=0, reused_bytes=0)
+        for path, record in records.items():
+            self.check()
+            if record["status"] == "skipped":
+                skipped += 1
+                continue
+            self.update(job, current=path)
+            names = parts(path)
+            with directory(data, "/".join(names[:-1])) as parent:
+                if self.hash_file(parent, names[-1]) != (record["size"], record["sha256"]):
+                    raise RuntimeError("Saved NAS checksum mismatch; cannot finalize: " + path)
+            files += 1
+            total += record["size"]
+            self.update(job, reused_files=files, reused_bytes=total)
+        if (files, total, skipped) != expected:
+            raise RuntimeError("Verification manifest does not match the saved completed transfer.")
+
+    def check_resume_source(self, src, data, job, is_camera):
+        # Check every completed file before replacing any unfinished file.
+        # A wrong reconnect must not add new data to the saved transfer first.
+        for path, record in self.resume_records.items():
+            self.check()
+            if record["status"] != "verified":
+                continue
+            self.update(job, state="resuming", current=path)
+            names = parts(path)
+            if is_camera:
+                info = src.stat(path)
+                if info["kind"] != "file":
+                    raise RuntimeError("Source file changed type: " + path)
+                digest, count = hashlib.sha256(), 0
+                with src.stream(path, info, self.check) as chunks:
+                    for chunk in chunks:
+                        self.check()
+                        digest.update(chunk)
+                        count += len(chunk)
+                source_hash = (count, digest.hexdigest())
+            else:
+                with directory(src, "/".join(names[:-1])) as parent:
+                    source_hash = self.hash_file(parent, names[-1])
+            with directory(data, "/".join(names[:-1])) as parent:
+                self.reuse(parent, names[-1], path, record, source_hash, job)
+        # Traversal must still encounter each previously recorded path.
+        self.resume_seen.clear()
+
+    def run(self, job, paths, resuming=False):
+        self.resume_records = {} if resuming else None
+        self.resume_seen = set()
+        self.resume_pending = job.get("pending_path") if resuming else None
         try:
             with contextlib.ExitStack() as stack:
                 is_camera = isinstance(job["device"], str) and job["device"].startswith("camera:")
-                if is_camera:
-                    src = self.hardware.camera_source(job["device"])
-                else:
-                    src = self.hardware.source(job["device"])
-                    stack.callback(os.close, src)
                 nas = self.hardware.nas()
                 stack.callback(os.close, nas)
-                # Pin the chosen directory inside the verified NAS mount.
                 target = stack.enter_context(directory(nas, job.get("destination_folder", "")))
-                if "total_bytes" in job:
+                if not resuming and "total_bytes" in job:
                     self.check_space(target, job["total_bytes"])
                 try:
                     os.mkdir("Pi-Imports", 0o700, dir_fd=target)
@@ -396,50 +609,119 @@ class Transfers:
                 imports = stack.enter_context(directory(target, "Pi-Imports"))
                 prefix = job.get("destination_folder", "")
                 prefix = (prefix + "/" if prefix else "") + "Pi-Imports/"
-                stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + job["id"]
-                incomplete = ".incomplete-" + stamp
-                os.mkdir(incomplete, 0o700, dir_fd=imports)
-                dest = stack.enter_context(directory(imports, incomplete))
-                os.mkdir("data", 0o700, dir_fd=dest)
-                data = stack.enter_context(directory(dest, "data"))
-                manifest = stack.enter_context(os.fdopen(os.open("checksums.jsonl", WRITE, 0o600, dir_fd=dest), "w", encoding="utf-8"))
-                self.update(job, state="copying", destination=prefix + incomplete)
-                with self.lock:
-                    self.save()
-                for path in paths:
-                    self.check()
-                    if is_camera:
-                        self.copy_camera_selection(src, data, path, job, manifest)
-                    elif not path:
-                        self.copy_dir(src, data, "", job, manifest, 0)
+                if not job.get("destination"):
+                    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + job["id"]
+                    self.checkpoint(job, destination=prefix + ".incomplete-" + stamp)
+                prefix, incomplete, final = self.destination_parts(job)
+                already_renamed = False
+                try:
+                    os.stat(final, dir_fd=imports, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not resuming or not job.get("copy_complete"):
+                        raise FileExistsError("Final transfer folder already exists; left unchanged.")
+                    try:
+                        os.stat(incomplete, dir_fd=imports, follow_symlinks=False)
+                    except FileNotFoundError:
+                        already_renamed = True
                     else:
-                        components = parts(path)
-                        with directory(src, "/".join(components[:-1])) as parent:
-                            out = os.dup(data)
-                            try:
-                                for comp in components[:-1]:
+                        raise FileExistsError("Both transfer folders exist; neither was changed.")
+                if not job.get("copy_complete"):
+                    self.make_folder(imports, incomplete)
+                # Close every handle inside the transfer before renaming it.
+                # SMB servers may deny a directory rename while children are open.
+                with contextlib.ExitStack() as files:
+                    dest = files.enter_context(directory(imports, final if already_renamed else incomplete))
+                    if not job.get("copy_complete"):
+                        self.make_folder(dest, "data")
+                    data = files.enter_context(directory(dest, "data"))
+                    flags = READ if job.get("copy_complete") else (os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                    if not resuming:
+                        flags |= os.O_EXCL
+                    manifest = files.enter_context(os.fdopen(os.open("checksums.jsonl", flags, 0o600, dir_fd=dest), "rb" if job.get("copy_complete") else "r+b"))
+                    info = os.fstat(manifest.fileno())
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise ValueError("Invalid verification manifest file")
+                    if resuming:
+                        self.resume_records, end = self.read_manifest(manifest, allow_tail=not job.get("copy_complete"))
+                    if job.get("copy_complete"):
+                        self.verify_saved(data, self.resume_records, job)
+                    else:
+                        if resuming:
+                            manifest.seek(end)
+                            manifest.truncate()
+                            manifest.flush()
+                            os.fsync(manifest.fileno())
+                        if is_camera:
+                            src = self.hardware.camera_source(job["device"])
+                        else:
+                            src = self.hardware.source(job["device"])
+                            files.callback(os.close, src)
+                        if self.resume_pending and self.resume_pending not in (self.resume_records or {}):
+                            if is_camera:
+                                pending_info = src.stat(self.resume_pending)
+                                regular = pending_info["kind"] == "file"
+                            else:
+                                names = parts(self.resume_pending)
+                                with directory(src, "/".join(names[:-1])) as parent:
+                                    regular = stat.S_ISREG(os.stat(names[-1], dir_fd=parent, follow_symlinks=False).st_mode)
+                            if not regular:
+                                raise RuntimeError("The unfinished source file changed type. Select the original camera/card.")
+                        self.update(job, state="resuming" if resuming else "copying", files=0, bytes=0, skipped=0, reused_files=0, reused_bytes=0)
+                        if resuming:
+                            self.check_resume_source(src, data, job, is_camera)
+                        for path in paths:
+                            self.check()
+                            if is_camera:
+                                self.copy_camera_selection(src, data, path, job, manifest)
+                            elif not path:
+                                self.copy_dir(src, data, "", job, manifest, 0)
+                            else:
+                                components = parts(path)
+                                with directory(src, "/".join(components[:-1])) as parent:
+                                    out = os.dup(data)
                                     try:
-                                        os.mkdir(comp, 0o700, dir_fd=out)
-                                    except FileExistsError:
-                                        pass
-                                    next_fd = os.open(comp, DIRECTORY, dir_fd=out)
-                                    os.close(out)
-                                    out = next_fd
-                                self.copy_entry(parent, out, components[-1], path, job, manifest, 0)
-                            finally:
-                                os.close(out)
+                                        for comp in components[:-1]:
+                                            try:
+                                                os.mkdir(comp, 0o700, dir_fd=out)
+                                            except FileExistsError:
+                                                pass
+                                            next_fd = os.open(comp, DIRECTORY, dir_fd=out)
+                                            os.close(out)
+                                            out = next_fd
+                                        self.copy_entry(parent, out, components[-1], path, job, manifest, 0)
+                                    finally:
+                                        os.close(out)
+                        if resuming and (set(self.resume_records) - self.resume_seen
+                                         or self.resume_pending and self.resume_pending not in self.resume_seen):
+                            raise RuntimeError("Source is missing previously selected files. Select the original camera/card.")
+                        self.check()
+                        manifest.flush()
+                        os.fsync(manifest.fileno())
+                        self.checkpoint(job, copy_complete=True, pending_path=None, state="finalizing")
                 self.check()
-                manifest.flush()
-                os.fsync(manifest.fileno())
-                # Commit only after every selected regular file has passed read-back.
-                final = "transfer-" + stamp
-                os.rename(incomplete, final, src_dir_fd=imports, dst_dir_fd=imports)
+                self.update(job, state="finalizing", current="")
+                if not already_renamed:
+                    try:
+                        os.stat(final, dir_fd=imports, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise FileExistsError("Final transfer folder appeared during copying; left unchanged.")
+                    try:
+                        os.rename(incomplete, final, src_dir_fd=imports, dst_dir_fd=imports)
+                    except PermissionError as exc:
+                        raise RuntimeError("All files verified, but the NAS denied the final folder rename. Check NAS rename permissions, then Resume; no files need copying again.") from exc
                 self.update(job, state="complete_with_skips" if job["skipped"] else "complete", current="", destination=prefix + final)
         except Cancelled as exc:
             self.update(job, state="cancelled", error=str(exc))
         except Exception as exc:
             self.update(job, state="failed", error=str(exc)[:800])
         finally:
+            self.resume_records = None
+            self.resume_pending = None
+            self.resume_seen = set()
             try:
                 with self.lock:
                     self.save()
@@ -490,7 +772,7 @@ class Transfers:
         camera_parts(path)
         info = source.stat(path)
         if info["kind"] == "folder":
-            os.mkdir(name, 0o700, dir_fd=dest)
+            self.make_folder(dest, name)
             with directory(dest, name) as child:
                 self.copy_camera_dir(source, child, path, job, manifest, depth + 1)
         elif info["kind"] == "file":
@@ -502,6 +784,11 @@ class Transfers:
         size = info.get("size")
         if size is not None and (type(size) is not int or size < 0):
             raise ValueError("Invalid camera file size")
+        record = self.verified_record(path)
+        if record:
+            self.resume_seen.add(path)
+            return
+        self.prepare_file(dest, name, path, job)
         self.check_space(dest, size or 0)
         self.update(job, state="copying", current=path)
         digest = hashlib.sha256()
@@ -546,21 +833,31 @@ class Transfers:
         self.check()
         before = os.stat(name, dir_fd=src, follow_symlinks=False)
         if stat.S_ISDIR(before.st_mode):
-            os.mkdir(name, 0o700, dir_fd=dest)
+            self.make_folder(dest, name)
             with directory(src, name) as s, directory(dest, name) as d:
                 self.copy_dir(s, d, path, job, manifest, depth + 1)
         elif stat.S_ISREG(before.st_mode):
             self.copy_file(src, dest, name, path, job, manifest)
         else:
+            record = (self.resume_records or {}).get(path)
+            if record and record["status"] != "skipped":
+                raise RuntimeError("Source item changed type since the previous attempt: " + path)
+            self.resume_seen.add(path)
             self.update(job, skipped=job["skipped"] + 1)
-            manifest.write(json.dumps({"path": path, "status": "skipped", "reason": "Symlink or special file"}) + "\n")
+            if not record:
+                self.write_record(manifest, {"path": path, "status": "skipped", "reason": "Symlink or special file"})
 
     def copy_file(self, src, dest, name, path, job, manifest):
+        record = self.verified_record(path)
+        if record:
+            self.resume_seen.add(path)
+            return
         self.update(job, state="copying", current=path)
         with os.fdopen(os.open(name, READ, dir_fd=src), "rb") as source:
             before = os.fstat(source.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("Source changed type")
+            self.prepare_file(dest, name, path, job)
             self.check_space(dest, before.st_size)
             digest = hashlib.sha256()
             copied = 0
@@ -597,5 +894,11 @@ class Transfers:
             raise RuntimeError("Checksum mismatch: " + path)
         if times is not None:
             os.utime(name, ns=times, dir_fd=dest, follow_symlinks=False)
-        manifest.write(json.dumps({"path": path, "size": copied, "sha256": digest.hexdigest(), "status": "verified"}) + "\n")
-        self.update(job, files=job["files"] + 1, state="copying")
+        self.write_record(manifest, {"path": path, "size": copied, "sha256": digest.hexdigest(), "status": "verified"})
+        self.checkpoint(job, files=job["files"] + 1, state="copying", pending_path=None)
+
+    @staticmethod
+    def write_record(manifest, record):
+        manifest.write((json.dumps(record) + "\n").encode())
+        manifest.flush()
+        os.fsync(manifest.fileno())

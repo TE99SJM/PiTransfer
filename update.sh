@@ -18,7 +18,7 @@ for name in ('app.py', 'core.py', 'drive_helper.py', 'camera.py', 'camera_worker
     ast.parse(Path(name).read_text(), filename=name)
 config = json.loads(Path('/etc/pi-nas-drop/config.json').read_text())
 history = Path(config['history_path'])
-if history.exists() and any(j['state'] in ('queued', 'copying', 'verifying') for j in json.loads(history.read_text())):
+if history.exists() and any(j['state'] in ('queued', 'copying', 'verifying', 'resuming', 'finalizing') for j in json.loads(history.read_text())):
     raise SystemExit('A transfer is active. Finish or cancel it in PiTransfer before updating.')
 PY
 apt-get update
@@ -55,7 +55,7 @@ import json
 from pathlib import Path
 c = json.loads(Path('/etc/pi-nas-drop/config.json').read_text())
 p = Path(c['history_path'])
-if p.exists() and any(j['state'] in ('queued', 'copying', 'verifying') for j in json.loads(p.read_text())):
+if p.exists() and any(j['state'] in ('queued', 'copying', 'verifying', 'resuming', 'finalizing') for j in json.loads(p.read_text())):
     raise SystemExit('A transfer started during preparation. Finish it before updating.')
 PY
 systemctl stop pi-nas-drop.service
