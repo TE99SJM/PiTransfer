@@ -70,6 +70,19 @@ class WebTest(unittest.TestCase):
         self.assertEqual(self.request('/api/login','POST',{'password':'test-only-password'}, HTTP_ORIGIN='https://attacker.example')['status'],403)
         self.assertEqual(self.request('/api/login','POST', CONTENT_TYPE='text/plain')['status'],400)
 
+    def test_camera_metadata_has_no_media_endpoint(self):
+        from tests.test_cameras import DEVICE, FakeCamera
+        camera = FakeCamera()
+        self.app.hardware.camera_source = lambda device: camera
+        self.login()
+        r = self.request('/api/browse', 'POST', {'device': DEVICE, 'path': 'DCIM/100GOPRO'})
+        self.assertEqual(r['status'], 200)
+        self.assertIn('clip.MP4', str(r['body']))
+        self.assertEqual(camera.opened, [])
+        for endpoint in ('/api/camera/download', '/api/camera/preview', '/api/camera/capture', '/api/camera/delete'):
+            self.assertEqual(self.request(endpoint, 'POST', {'device': DEVICE})['status'], 404)
+        self.assertEqual(camera.opened, [])
+
     def test_rate_limit_and_wrong_password(self):
         # Use a stub digest to keep repeated brute-force rejection testing quick.
         from unittest.mock import patch

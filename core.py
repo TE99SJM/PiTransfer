@@ -11,6 +11,9 @@ import time
 import uuid
 from pathlib import Path
 
+from camera import Cameras
+from camera_worker import components as camera_parts, safe_name
+
 CHUNK = 1024 * 1024
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -64,6 +67,8 @@ def listing(root_fd, path="", offset=0):
 class Hardware:
     def __init__(self, config):
         self.config = config
+        self.cameras = Cameras()
+        self.camera_error = ""
 
     def helper(self, action, device=None):
         args = ["/usr/bin/sudo", "-n", "/usr/bin/python3", "-I", "/opt/pi-nas-drop/drive_helper.py", action]
@@ -77,13 +82,24 @@ class Hardware:
         return json.loads(result.stdout)
 
     def devices(self):
-        return self.helper("list")
+        devices = self.helper("list")
+        try:
+            devices.extend(self.cameras.devices())
+            self.camera_error = ""
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.camera_error = str(exc)
+        return devices
+
+    def camera_source(self, device):
+        return self.cameras.source(device)
 
     def source(self, device):
         mounted = self.helper("mount", device)
         return os.open(mounted["path"], DIRECTORY)
 
     def eject(self, device):
+        if isinstance(device, str) and device.startswith("camera:"):
+            return {"ok": True, "message": "Camera sessions are closed. You can unplug the camera."}
         return self.helper("eject", device)
 
     def nas(self):
@@ -126,13 +142,19 @@ class Transfers:
         self.lock = threading.RLock()
         self.operation = threading.Lock()
         self.cancel_event = threading.Event()
+        self.device_cache = []
+        self.device_cache_time = 0
         try:
             self.jobs = json.loads(self.history_path.read_text())[-30:]
         except (OSError, ValueError):
             self.jobs = []
+        interrupted = False
         for job in self.jobs:
             if job["state"] in ACTIVE:
                 job.update(state="interrupted", error="Service stopped. Originals are unchanged; incomplete NAS folder retained. Start a new copy.")
+                interrupted = True
+        if interrupted:
+            self.save()
 
     def save(self):
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -144,10 +166,25 @@ class Transfers:
         with self.lock:
             return [dict(j) for j in reversed(self.jobs)]
 
+    def devices(self):
+        # Discovery must not contend with a camera copy or metadata session.
+        if not self.operation.acquire(blocking=False):
+            return list(self.device_cache)
+        try:
+            if time.monotonic() - self.device_cache_time >= 4:
+                self.device_cache = self.hardware.devices()
+                self.device_cache_time = time.monotonic()
+            return list(self.device_cache)
+        finally:
+            self.operation.release()
+
     def browse(self, device, path, offset):
         if not self.operation.acquire(blocking=False):
             raise RuntimeError("Wait for the drive operation to finish.")
         try:
+            if isinstance(device, str) and device.startswith("camera:"):
+                camera_parts(path)
+                return self.hardware.camera_source(device).listing(path, offset)
             fd = self.hardware.source(device)
             try:
                 return listing(fd, path, offset)
@@ -170,6 +207,8 @@ class Transfers:
         paths = sorted(set(paths))
         for p in paths:
             parts(p)
+            if isinstance(device, str) and device.startswith("camera:"):
+                camera_parts(p)
         # Parent selection already includes its descendants.
         paths = [p for p in paths if not any(p != q and (q == "" or p.startswith(q + "/")) for q in paths)]
         if not self.operation.acquire(blocking=False):
@@ -203,8 +242,12 @@ class Transfers:
     def run(self, job, paths):
         try:
             with contextlib.ExitStack() as stack:
-                src = self.hardware.source(job["device"])
-                stack.callback(os.close, src)
+                is_camera = isinstance(job["device"], str) and job["device"].startswith("camera:")
+                if is_camera:
+                    src = self.hardware.camera_source(job["device"])
+                else:
+                    src = self.hardware.source(job["device"])
+                    stack.callback(os.close, src)
                 nas = self.hardware.nas()
                 stack.callback(os.close, nas)
                 try:
@@ -224,7 +267,9 @@ class Transfers:
                     self.save()
                 for path in paths:
                     self.check()
-                    if not path:
+                    if is_camera:
+                        self.copy_camera_selection(src, data, path, job, manifest)
+                    elif not path:
                         self.copy_dir(src, data, "", job, manifest, 0)
                     else:
                         components = parts(path)
@@ -260,6 +305,92 @@ class Transfers:
             finally:
                 self.operation.release()
 
+    def copy_camera_selection(self, source, dest, path, job, manifest):
+        names = camera_parts(path)
+        if not names:
+            self.copy_camera_dir(source, dest, "", job, manifest, 0)
+            return
+        out = os.dup(dest)
+        try:
+            for name in names[:-1]:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=out)
+                except FileExistsError:
+                    pass
+                child = os.open(name, DIRECTORY, dir_fd=out)
+                os.close(out)
+                out = child
+            self.copy_camera_entry(source, out, names[-1], path, job, manifest, len(names) - 1)
+        finally:
+            os.close(out)
+
+    def copy_camera_dir(self, source, dest, path, job, manifest, depth):
+        if depth > 64:
+            raise ValueError("Camera directory nesting exceeds 64 levels")
+        offset = 0
+        while True:
+            self.check()
+            page = source.listing(path, offset)
+            for entry in page["items"]:
+                self.check()
+                name = safe_name(entry["name"])
+                child_path = path + "/" + name if path else name
+                camera_parts(child_path)
+                self.copy_camera_entry(source, dest, name, child_path, job, manifest, depth)
+            if not page["more"]:
+                break
+            if not page["items"]:
+                raise RuntimeError("Camera returned an invalid directory page")
+            offset += len(page["items"])
+
+    def copy_camera_entry(self, source, dest, name, path, job, manifest, depth):
+        self.check()
+        safe_name(name)
+        camera_parts(path)
+        info = source.stat(path)
+        if info["kind"] == "folder":
+            os.mkdir(name, 0o700, dir_fd=dest)
+            with directory(dest, name) as child:
+                self.copy_camera_dir(source, child, path, job, manifest, depth + 1)
+        elif info["kind"] == "file":
+            self.copy_camera_file(source, dest, name, path, info, job, manifest)
+        else:
+            raise ValueError("Unsupported camera item")
+
+    def copy_camera_file(self, source, dest, name, path, info, job, manifest):
+        size = info.get("size")
+        if size is not None and (type(size) is not int or size < 0):
+            raise ValueError("Invalid camera file size")
+        self.check_space(dest, size or 0)
+        self.update(job, state="copying", current=path)
+        digest = hashlib.sha256()
+        copied = 0
+        with os.fdopen(os.open(name, WRITE, 0o600, dir_fd=dest), "wb") as output:
+            with source.stream(path, info, self.check) as chunks:
+                for chunk in chunks:
+                    self.check()
+                    if size is not None and copied + len(chunk) > size:
+                        raise RuntimeError("Camera sent more data than expected: " + path)
+                    if size is None:
+                        self.check_space(dest, len(chunk))
+                    output.write(chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+                    self.update(job, bytes=job["bytes"] + len(chunk))
+            output.flush()
+            os.fsync(output.fileno())
+        if size is not None and copied != size:
+            raise RuntimeError("Camera transfer was incomplete: " + path)
+        mtime = info.get("mtime")
+        times = (mtime * 1000000000, mtime * 1000000000) if mtime is not None else None
+        self.verify_copy(dest, name, path, copied, digest, times, job, manifest)
+
+    @staticmethod
+    def check_space(dest, size):
+        space = os.fstatvfs(dest)
+        if size + 16 * CHUNK > space.f_bavail * space.f_frsize:
+            raise RuntimeError("Not enough free space on NAS; originals are unchanged.")
+
     def copy_dir(self, src, dest, prefix, job, manifest, depth):
         if depth > 64:
             raise ValueError("Directory nesting exceeds 64 levels")
@@ -289,9 +420,7 @@ class Transfers:
             before = os.fstat(source.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise ValueError("Source changed type")
-            space = os.fstatvfs(dest)
-            if before.st_size + 16 * CHUNK > space.f_bavail * space.f_frsize:
-                raise RuntimeError("Not enough free space on NAS; originals are unchanged.")
+            self.check_space(dest, before.st_size)
             digest = hashlib.sha256()
             copied = 0
             with os.fdopen(os.open(name, WRITE, 0o600, dir_fd=dest), "wb") as output:
@@ -309,6 +438,9 @@ class Transfers:
             after = os.fstat(source.fileno())
             if copied != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                 raise RuntimeError("Source changed during copy: " + path)
+        self.verify_copy(dest, name, path, copied, digest, (before.st_atime_ns, before.st_mtime_ns), job, manifest)
+
+    def verify_copy(self, dest, name, path, copied, digest, times, job, manifest):
         self.update(job, state="verifying")
         check = hashlib.sha256()
         with os.fdopen(os.open(name, READ, dir_fd=dest), "rb") as output:
@@ -322,6 +454,7 @@ class Transfers:
                 check.update(chunk)
         if digest.digest() != check.digest():
             raise RuntimeError("Checksum mismatch: " + path)
-        os.utime(name, ns=(before.st_atime_ns, before.st_mtime_ns), dir_fd=dest, follow_symlinks=False)
+        if times is not None:
+            os.utime(name, ns=times, dir_fd=dest, follow_symlinks=False)
         manifest.write(json.dumps({"path": path, "size": copied, "sha256": digest.hexdigest(), "status": "verified"}) + "\n")
         self.update(job, files=job["files"] + 1, state="copying")

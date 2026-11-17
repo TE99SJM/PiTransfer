@@ -20,19 +20,19 @@ function button(text, fn, cls='quiet') { const b=node('button',text,cls); b.addE
 function controls() { $('copy-selected').disabled = !device || !selected.size || !nasReady || busy; $('copy-selected').textContent = selected.size ? `Copy selected (${selected.size})` : 'Copy selected'; $('copy-all').disabled = !device || !nasReady || busy; }
 function renderDrives() {
   $('drives').replaceChildren();
-  if (!devices.length) $('drives').append(node('p','No USB storage detected.','empty'));
+  if (!devices.length) $('drives').append(node('p','No USB drives or supported cameras detected.','empty'));
   for (const d of devices) {
     const card=node('div',undefined,'drive' + (device === d.id ? ' active':''));
-    card.append(node('h3',d.label),node('p',`${bytes(d.size)} · ${d.filesystem.toUpperCase()} · ${d.node}`));
+    card.append(node('h3',d.label),node('p',[bytes(d.size),d.filesystem.toUpperCase(),d.node].filter(Boolean).join(' · ')));
     if (d.reason) card.append(node('p',d.reason));
     const row=node('div',undefined,'drive-actions');
-    const choose=button('Select drive',async()=>{ device=d.id; currentPath=''; offset=0; selected.clear(); await browse(); renderDrives(); }); choose.disabled=!d.usable || busy;
+    const choose=button(d.kind==='camera'?'Select camera':'Select drive',async()=>{ device=d.id; currentPath=''; offset=0; selected.clear(); await browse(); renderDrives(); }); choose.disabled=!d.usable || busy;
     row.append(choose);
     if (d.mounted) { const eject=button('Unmount',async()=>{ const r=await api('eject',{device:d.id}); if(device===d.id) resetBrowser(); notice(r.message); await refresh(); }); eject.disabled=busy; row.append(eject); }
     card.append(row); $('drives').append(card);
   }
 }
-function resetBrowser(){device=null;selected.clear();$('files-title').textContent='Choose a drive';$('breadcrumb').textContent='File names and folders only';$('files').replaceChildren(node('p','Select a connected drive.','empty'));$('up').hidden=true;$('previous').hidden=true;$('next').hidden=true;controls();}
+function resetBrowser(){device=null;selected.clear();$('files-title').textContent='Choose a device';$('breadcrumb').textContent='File names and folders only';$('files').replaceChildren(node('p','Select a connected drive or camera.','empty'));$('up').hidden=true;$('previous').hidden=true;$('next').hidden=true;controls();}
 async function browse() {
   const data=await api('browse',{device,path:currentPath,offset});
   $('files-title').textContent=devices.find(d=>d.id===device)?.label || 'Drive';
@@ -66,9 +66,10 @@ async function refresh() {
   const s=await api('status');devices=s.devices;nasReady=s.nas.ready;
   $('nas-title').textContent=nasReady?'NAS ready':'NAS unavailable';$('nas-detail').textContent=nasReady?`${s.nas.destination} · ${bytes(s.nas.free)} available`:s.nas.error;
   $('nas-status').textContent=nasReady?'Encrypted SMB3':'Not connected';
+  $('camera-status').textContent=s.camera_error || 'Cameras: choose MTP, PTP, or File Transfer mode. Webcam and charging modes do not expose stored files.';
   if(device&&!devices.some(d=>d.id===device))resetBrowser();renderJobs(s.jobs);renderDrives();
 }
-async function transfer(paths) { const name=devices.find(d=>d.id===device)?.label || 'drive'; if(!confirm(`Copy ${paths[0]===''?'the entire drive':paths.length+' selected item(s)'} from ${name} to a NEW NAS folder? Originals will stay on the drive.`))return; await api('transfer',{device,paths});selected.clear();await refresh(); }
+async function transfer(paths) { const name=devices.find(d=>d.id===device)?.label || 'device'; if(!confirm(`Copy ${paths[0]===''?'all accessible files':paths.length+' selected item(s)'} from ${name} to a NEW NAS folder? Originals will stay on the device.`))return; await api('transfer',{device,paths});selected.clear();await refresh(); }
 $('login-form').addEventListener('submit',event=>{event.preventDefault();act(async()=>{const r=await api('login',{password:$('password').value});$('password').value='';csrf=r.csrf;appView();await refresh();});});
 $('logout').addEventListener('click',()=>act(async()=>{await api('logout',{});loginView();}));
 $('refresh').addEventListener('click',()=>act(refresh));

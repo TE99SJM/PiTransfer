@@ -108,7 +108,8 @@ class App:
 
     def route(self, path, method, data, env):
         if (method, path) == ("GET", "/api/status"):
-            return {"devices": self.hardware.devices(), "nas": self.hardware.nas_status(), "jobs": self.transfers.snapshot()}
+            return {"devices": self.transfers.devices(), "nas": self.hardware.nas_status(),
+                    "jobs": self.transfers.snapshot(), "camera_error": getattr(self.hardware, "camera_error", "")}
         if (method, path) == ("GET", "/api/jobs"):
             return {"jobs": self.transfers.snapshot()}
         # Browsing can mount a source read-only, so it is deliberately a CSRF-protected POST.
