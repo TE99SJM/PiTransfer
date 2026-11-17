@@ -134,6 +134,17 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.request('/api/resume', 'POST', payload)['status'], 200)
             resume.assert_called_once_with('saved-job', 'usb')
 
+    def test_queue_requires_login_csrf_and_preserves_destination(self):
+        from unittest.mock import patch
+        payload = {'device':'usb', 'destination_folder':'Video'}
+        with patch.object(self.app.transfers, 'start', return_value={'id':'waiting-job','state':'queued'}) as start:
+            self.assertEqual(self.request('/api/queue', 'POST', payload)['status'], 401)
+            self.login()
+            self.assertEqual(self.request('/api/queue', 'POST', payload, HTTP_X_CSRF_TOKEN='wrong')['status'], 403)
+            start.assert_not_called()
+            self.assertEqual(self.request('/api/queue', 'POST', payload)['status'], 200)
+            start.assert_called_once_with('usb', [''], destination_folder='Video', enqueue=True)
+
     def test_rate_limit_and_wrong_password(self):
         # Use a stub digest to keep repeated brute-force rejection testing quick.
         from unittest.mock import patch

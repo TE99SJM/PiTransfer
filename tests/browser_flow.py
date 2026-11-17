@@ -3,6 +3,7 @@
 Run explicitly with Playwright/Chromium installed. Never connects to real hardware.
 """
 from pathlib import Path
+import contextlib
 import errno
 import os
 import sys
@@ -29,10 +30,12 @@ def main():
     with tempfile.TemporaryDirectory() as temp:
         hardware = FakeHardware(temp)
         camera = FakeCamera()
-        hardware.camera_source = lambda device: camera
-        hardware.devices = lambda: [{"id": DEVICE, "label": "GoPro HERO9 Black", "kind": "camera",
+        cameras = {DEVICE:camera}
+        hardware.camera_source = lambda device: cameras[device]
+        available = [{"id": DEVICE, "label": "GoPro HERO9 Black", "kind": "camera",
                                      "size": None, "node": "usb:001,003", "filesystem": "PTP/MTP",
                                      "usable": True, "mounted": False}]
+        hardware.devices = lambda exclude=None: [d for d in available if d['node'] not in (exclude or [])]
         for name in ('Video', 'Photos', 'Mounted Drive'):
             (hardware.dst / name).mkdir()
         (hardware.dst / 'do-not-display.txt').write_text('private NAS contents')
@@ -133,11 +136,54 @@ def main():
                     assert camera.opened == downloads, 'Finalization downloaded the camera files again'
                     expect(page.locator('#jobs .job').first).to_contain_text('1 saved files rechecked')
 
+                    # A progress bar exists for old resume jobs and for every camera.
+                    assert page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") == 28
+                    assert page.evaluate("jobProgress({state:'verifying',total_bytes:100,bytes:100,checked_bytes:50}).percent") == 75
+                    assert page.evaluate("jobProgress({state:'copying',total_files:4,files:1,unknown_files:1,bytes:10}).percent") == 25
+                    second = 'camera:002:004:aaaaaaaaaaaaaaaa'
+                    cameras[second] = FakeCamera()
+                    available.append(dict(available[0], id=second, label='Second USB camera', node='usb:002,004'))
+                    gate, entered = threading.Event(), threading.Event()
+                    original_stream = camera.stream
+                    @contextlib.contextmanager
+                    def gated_stream(path, expected, check):
+                        entered.set()
+                        if not gate.wait(30):
+                            raise RuntimeError('Browser test gate timed out')
+                        with original_stream(path, expected, check) as chunks:
+                            yield chunks
+                    camera.stream = gated_stream
+                    try:
+                        active = application.transfers.start(DEVICE, ['note.txt'])
+                        assert entered.wait(5)
+                        application.transfers.device_cache_time = 0
+                        page.get_by_role('button', name='Refresh', exact=True).click()
+                        second_card = page.locator('#drives .drive').filter(has_text='Second USB camera')
+                        expect(second_card.get_by_role('button', name='Queue all files')).to_be_enabled()
+                        page.once('dialog', lambda dialog: dialog.accept())
+                        second_card.get_by_role('button', name='Queue all files').click()
+                        expect(page.locator('#notice')).to_contain_text('added to the transfer queue')
+                        waiting = next(j for j in application.transfers.snapshot() if j['device']==second)
+                        queued_card = page.locator(f'[data-job-id="{waiting["id"]}"]')
+                        running_card = page.locator(f'[data-job-id="{active["id"]}"]')
+                        expect(queued_card).to_contain_text('queue position 1')
+                        expect(queued_card.locator('progress')).to_have_attribute('value','0')
+                        expect(running_card.locator('progress')).to_have_count(1)
+                        expect(queued_card.get_by_role('button',name='Remove from queue')).to_be_enabled()
+                        gate.set()
+                        expect(queued_card.locator('.pill')).to_have_text('complete',timeout=15000)
+                        expect(running_card.locator('.pill')).to_have_text('complete',timeout=15000)
+                        expect(queued_card.locator('progress')).to_have_attribute('value','100')
+                        expect(page.locator('#jobs progress')).to_have_count(len(application.transfers.snapshot()))
+                    finally:
+                        gate.set()
+                        camera.stream = original_stream
+
                     page.set_viewport_size({"width":390,"height":844})
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'
                     assert not errors, errors
                     browser.close()
-                    print('Browser checks passed: NAS folders, size totals, unknown sizes, cancel, copy confirmation, destination, legacy failed-transfer resume without another download, and mobile width.')
+                    print('Browser checks passed: folders, sizing, cancellation, transfer/resume, per-camera bars, second-camera queue, completion percentages, and mobile width.')
             finally:
                 server.shutdown()
 

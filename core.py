@@ -18,7 +18,7 @@ CHUNK = 1024 * 1024
 DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-ACTIVE = {"queued", "copying", "verifying", "resuming", "finalizing"}
+ACTIVE = {"queued", "starting", "counting", "copying", "verifying", "resuming", "finalizing"}
 RETRYABLE = {"failed", "cancelled", "interrupted"}
 ESTIMATING = {"queued", "counting"}
 
@@ -116,10 +116,10 @@ class Hardware:
             raise RuntimeError(result.stderr.strip()[:600] or "Drive operation failed")
         return json.loads(result.stdout)
 
-    def devices(self):
+    def devices(self, exclude=None):
         devices = self.helper("list")
         try:
-            devices.extend(self.cameras.devices())
+            devices.extend(self.cameras.devices(exclude))
             self.camera_error = ""
         except (OSError, ValueError, RuntimeError) as exc:
             self.camera_error = str(exc)
@@ -177,6 +177,9 @@ class Transfers:
         self.history_path = Path(history_path)
         self.lock = threading.RLock()
         self.operation = threading.Lock()
+        self.active_job = None
+        self.queue = []
+        self.discovering = False
         self.cancel_event = threading.Event()
         self.device_cache = []
         self.device_cache_time = 0
@@ -213,8 +216,37 @@ class Transfers:
 
     def snapshot(self):
         with self.lock:
+            positions = {j[0]["id"]: i + 1 for i, j in enumerate(self.queue)}
             return [dict(j, can_resume=bool(self.resume_mode(j)),
+                         queue_position=positions.get(j["id"], 0),
                          resume_needs_source=self.resume_mode(j) == "copy") for j in reversed(self.jobs)]
+
+    def acquire_operation(self):
+        with self.lock:
+            return not self.discovering and self.operation.acquire(blocking=False)
+
+    def release_operation(self, transfer=False):
+        with self.lock:
+            if transfer:
+                self.active_job = None
+            self.operation.release()
+            self.kick_queue()
+
+    def kick_queue(self):
+        # Called with self.lock held. One worker owns copy/resume state at a time.
+        if not self.queue or self.discovering or not self.operation.acquire(False):
+            return
+        job, paths, resuming = self.queue.pop(0)
+        self.active_job = job
+        job["state"] = "starting"
+        self.cancel_event.clear()
+        try:
+            threading.Thread(target=self.run, args=(job, paths, resuming), daemon=True).start()
+        except Exception as exc:
+            job.update(state="failed", error=str(exc))
+            self.active_job = None
+            self.operation.release()
+            self.save()
 
     @staticmethod
     def destination_parts(job):
@@ -248,7 +280,7 @@ class Transfers:
         return "copy" if job.get("resume_version") == 1 and job.get("paths") else None
 
     def resume(self, job_id, device=None):
-        if not self.operation.acquire(blocking=False):
+        if not self.acquire_operation():
             raise RuntimeError("Wait for the current drive operation to finish.")
         try:
             with self.lock:
@@ -273,27 +305,40 @@ class Transfers:
                 else:
                     job["device"] = device
                 self.cancel_event.clear()
+                self.active_job = job
                 self.save()
             threading.Thread(target=self.run, args=(job, paths, True), daemon=True).start()
         except Exception:
-            self.operation.release()
+            self.release_operation(transfer=True)
             raise
         return dict(job)
 
     def devices(self):
-        # Discovery must not contend with a camera copy or metadata session.
-        if not self.operation.acquire(blocking=False):
-            return list(self.device_cache)
+        with self.lock:
+            if (self.discovering or time.monotonic() - self.device_cache_time < 4
+                    or self.operation.locked() and self.active_job is None):
+                return list(self.device_cache)
+            self.discovering = True
+            active = self.active_job
+            excluded = []
+            if active and str(active["device"]).startswith("camera:"):
+                token = active["device"].split(":")
+                excluded = [f"usb:{token[1]},{token[2]}"]
         try:
-            if time.monotonic() - self.device_cache_time >= 4:
-                self.device_cache = self.hardware.devices()
+            found = self.hardware.devices(exclude=excluded) if excluded else self.hardware.devices()
+            with self.lock:
+                if excluded:
+                    found += [d for d in self.device_cache if d["id"] == active["device"] and not any(f["id"] == d["id"] for f in found)]
+                self.device_cache = found
                 self.device_cache_time = time.monotonic()
-            return list(self.device_cache)
+                return list(self.device_cache)
         finally:
-            self.operation.release()
+            with self.lock:
+                self.discovering = False
+                self.kick_queue()
 
     def browse(self, device, path, offset):
-        if not self.operation.acquire(blocking=False):
+        if not self.acquire_operation():
             raise RuntimeError("Wait for the drive operation to finish.")
         try:
             if isinstance(device, str) and device.startswith("camera:"):
@@ -305,15 +350,15 @@ class Transfers:
             finally:
                 os.close(fd)
         finally:
-            self.operation.release()
+            self.release_operation()
 
     def eject(self, device):
-        if not self.operation.acquire(blocking=False):
+        if not self.acquire_operation():
             raise RuntimeError("Wait for the transfer to finish before ejecting.")
         try:
             return self.hardware.eject(device)
         finally:
-            self.operation.release()
+            self.release_operation()
 
     def estimate_snapshot(self):
         with self.lock:
@@ -328,7 +373,7 @@ class Transfers:
 
     def estimate(self, device, paths):
         paths = selection(device, paths)
-        if not self.operation.acquire(blocking=False):
+        if not self.acquire_operation():
             raise RuntimeError("Wait for the current copy, browse, or size calculation to finish.")
         try:
             with self.lock:
@@ -338,7 +383,7 @@ class Transfers:
                 self.size_cancel.clear()
             threading.Thread(target=self.run_estimate, args=(job,), daemon=True).start()
         except Exception:
-            self.operation.release()
+            self.release_operation()
             raise
         return dict(job)
 
@@ -376,7 +421,7 @@ class Transfers:
         finally:
             with self.lock:
                 job.update(outcome, completed_at=time.time())
-                self.operation.release()
+                self.release_operation()
 
     @staticmethod
     def estimate_disk(root_fd, paths, check, progress):
@@ -409,7 +454,7 @@ class Transfers:
                     visit(parent, names[-1], len(names) - 1)
         progress(totals)
 
-    def start(self, device, paths, estimate_id=None, destination_folder=""):
+    def start(self, device, paths, estimate_id=None, destination_folder="", enqueue=False):
         paths = selection(device, paths)
         parts(destination_folder)
         estimate = None
@@ -419,28 +464,49 @@ class Transfers:
                     or estimate["device"] != device or estimate["paths"] != paths
                     or time.time() - estimate["completed_at"] > 300):
                 raise ValueError("Size estimate changed or expired. Calculate the size again.")
-        if not self.operation.acquire(blocking=False):
-            raise RuntimeError("A drive operation is already in progress.")
-        try:
-            with self.lock:
+        with self.lock:
+            if not enqueue and (self.operation.locked() or self.discovering):
+                raise RuntimeError("A drive operation is already in progress. Use Queue all files for another device.")
+            if len(self.queue) >= 10:
+                raise RuntimeError("The queue is full (10 waiting transfers).")
+            if any(j["device"] == device and j["state"] in ACTIVE for j in self.jobs):
+                raise RuntimeError("This device already has an active or queued transfer.")
+            source = next((d for d in self.device_cache if d["id"] == device), None)
+            if enqueue and (not source or not source.get("usable")):
+                raise ValueError("Refresh and choose a connected, supported device before queuing.")
+            if enqueue and paths != [""]:
+                raise ValueError("Queued devices copy all accessible files. Wait until idle to select individual files.")
+            try:
                 job = {"id": uuid.uuid4().hex[:12], "device": device, "state": "queued", "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": 0, "bytes": 0, "skipped": 0, "current": "", "destination": ""}
                 job["destination_folder"] = destination_folder
-                job.update(paths=paths, resume_version=1, attempts=1)
+                job.update(paths=paths, resume_version=1, attempts=1, checked_bytes=0,
+                           device_label=source["label"] if source else ("USB camera" if str(device).startswith("camera:") else "USB drive"),
+                           device_node=source.get("node", "") if source else "",
+                           needs_count=enqueue and estimate is None)
                 if estimate:
                     job.update(total_bytes=estimate["bytes"], total_files=estimate["files"],
                                unknown_files=estimate["unknown_files"])
-                self.jobs = self.jobs[-29:] + [job]
-                self.cancel_event.clear()
+                while len(self.jobs) >= 30:
+                    self.jobs.remove(next(j for j in self.jobs if j["state"] not in ACTIVE))
+                self.jobs.append(job)
                 self.save()
-            threading.Thread(target=self.run, args=(job, paths), daemon=True).start()
-        except Exception:
-            self.operation.release()
-            raise
+                self.queue.append((job, paths, False))
+                self.kick_queue()
+            except Exception:
+                if 'job' in locals() and job in self.jobs and job["state"] == "queued":
+                    self.jobs.remove(job)
+                raise
         return dict(job)
 
     def cancel(self, job_id):
         with self.lock:
-            if not self.jobs or self.jobs[-1]["id"] != job_id or self.jobs[-1]["state"] not in ACTIVE:
+            for index, (job, _, _) in enumerate(self.queue):
+                if job["id"] == job_id:
+                    self.queue.pop(index)
+                    job.update(state="cancelled", error="Removed from queue. No files were copied.")
+                    self.save()
+                    return
+            if not self.active_job or self.active_job["id"] != job_id:
                 raise ValueError("No active matching transfer")
             self.cancel_event.set()
 
@@ -451,6 +517,10 @@ class Transfers:
     def update(self, job, **fields):
         with self.lock:
             job.update(fields)
+
+    def advance_phase(self, job, amount):
+        with self.lock:
+            job["phase_bytes"] = job.get("phase_bytes", 0) + amount
 
     def checkpoint(self, job, **fields):
         with self.lock:
@@ -493,7 +563,7 @@ class Transfers:
             end = manifest.tell()
         return records, end
 
-    def hash_file(self, parent, name):
+    def hash_file(self, parent, name, on_chunk=None):
         digest, size = hashlib.sha256(), 0
         with os.fdopen(os.open(name, READ, dir_fd=parent), "rb") as source:
             before = os.fstat(source.fileno())
@@ -506,6 +576,8 @@ class Transfers:
                     break
                 size += len(chunk)
                 digest.update(chunk)
+                if on_chunk:
+                    on_chunk(len(chunk))
             after = os.fstat(source.fileno())
             if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                 raise RuntimeError("File changed during resume verification")
@@ -521,11 +593,12 @@ class Transfers:
         expected = (record["size"], record["sha256"])
         if source_hash != expected:
             raise RuntimeError("Source no longer matches the saved transfer. Select the original camera/card: " + path)
-        if self.hash_file(dest, name) != expected:
+        if self.hash_file(dest, name, lambda n: self.advance_phase(job, n)) != expected:
             raise RuntimeError("Saved NAS file is missing or changed; it was not overwritten: " + path)
         self.resume_seen.add(path)
         self.update(job, files=job["files"] + 1, bytes=job["bytes"] + record["size"],
-                    reused_files=job["reused_files"] + 1, reused_bytes=job["reused_bytes"] + record["size"])
+                    reused_files=job["reused_files"] + 1, reused_bytes=job["reused_bytes"] + record["size"],
+                    checked_bytes=job.get("checked_bytes", 0) + record["size"])
 
     def prepare_file(self, dest, name, path, job):
         if self.resume_records is not None:
@@ -545,7 +618,8 @@ class Transfers:
     def verify_saved(self, data, records, job):
         expected = (job["files"], job["bytes"], job["skipped"])
         files = total = skipped = 0
-        self.update(job, state="resuming", reused_files=0, reused_bytes=0)
+        self.update(job, state="resuming", reused_files=0, reused_bytes=0,
+                    phase="rechecking", phase_bytes=0, phase_total=expected[1])
         for path, record in records.items():
             self.check()
             if record["status"] == "skipped":
@@ -554,7 +628,7 @@ class Transfers:
             self.update(job, current=path)
             names = parts(path)
             with directory(data, "/".join(names[:-1])) as parent:
-                if self.hash_file(parent, names[-1]) != (record["size"], record["sha256"]):
+                if self.hash_file(parent, names[-1], lambda n: self.advance_phase(job, n)) != (record["size"], record["sha256"]):
                     raise RuntimeError("Saved NAS checksum mismatch; cannot finalize: " + path)
             files += 1
             total += record["size"]
@@ -565,6 +639,8 @@ class Transfers:
     def check_resume_source(self, src, data, job, is_camera):
         # Check every completed file before replacing any unfinished file.
         # A wrong reconnect must not add new data to the saved transfer first.
+        self.update(job, phase="rechecking", phase_bytes=0,
+                    phase_total=2 * sum(r["size"] for r in self.resume_records.values() if r["status"] == "verified"))
         for path, record in self.resume_records.items():
             self.check()
             if record["status"] != "verified":
@@ -581,20 +657,40 @@ class Transfers:
                         self.check()
                         digest.update(chunk)
                         count += len(chunk)
+                        self.advance_phase(job, len(chunk))
                 source_hash = (count, digest.hexdigest())
             else:
                 with directory(src, "/".join(names[:-1])) as parent:
-                    source_hash = self.hash_file(parent, names[-1])
+                    source_hash = self.hash_file(parent, names[-1], lambda n: self.advance_phase(job, n))
             with directory(data, "/".join(names[:-1])) as parent:
                 self.reuse(parent, names[-1], path, record, source_hash, job)
         # Traversal must still encounter each previously recorded path.
         self.resume_seen.clear()
+        self.update(job, phase="transfer")
+
+    def count_queued(self, job, paths):
+        self.update(job, state="counting", phase="counting", total_bytes=0, total_files=0, unknown_files=0)
+        def progress(totals):
+            self.check()
+            self.update(job, total_bytes=totals["bytes"], total_files=totals["files"], unknown_files=totals["unknown_files"])
+        if str(job["device"]).startswith("camera:"):
+            self.hardware.camera_source(job["device"]).estimate(paths, self.check, progress)
+        else:
+            fd = self.hardware.source(job["device"])
+            try:
+                self.estimate_disk(fd, paths, self.check, progress)
+            finally:
+                os.close(fd)
+        self.checkpoint(job, needs_count=False, phase="transfer", state="starting")
 
     def run(self, job, paths, resuming=False):
         self.resume_records = {} if resuming else None
         self.resume_seen = set()
         self.resume_pending = job.get("pending_path") if resuming else None
         try:
+            if job.get("needs_count"):
+                self.count_queued(job, paths)
+            self.update(job, phase="transfer")
             with contextlib.ExitStack() as stack:
                 is_camera = isinstance(job["device"], str) and job["device"].startswith("camera:")
                 nas = self.hardware.nas()
@@ -668,7 +764,7 @@ class Transfers:
                                     regular = stat.S_ISREG(os.stat(names[-1], dir_fd=parent, follow_symlinks=False).st_mode)
                             if not regular:
                                 raise RuntimeError("The unfinished source file changed type. Select the original camera/card.")
-                        self.update(job, state="resuming" if resuming else "copying", files=0, bytes=0, skipped=0, reused_files=0, reused_bytes=0)
+                        self.update(job, state="resuming" if resuming else "copying", files=0, bytes=0, skipped=0, reused_files=0, reused_bytes=0, checked_bytes=0)
                         if resuming:
                             self.check_resume_source(src, data, job, is_camera)
                         for path in paths:
@@ -726,7 +822,7 @@ class Transfers:
                 with self.lock:
                     self.save()
             finally:
-                self.operation.release()
+                self.release_operation(transfer=True)
 
     def copy_camera_selection(self, source, dest, path, job, manifest):
         names = camera_parts(path)
@@ -890,6 +986,7 @@ class Transfers:
                 if not chunk:
                     break
                 check.update(chunk)
+                self.update(job, checked_bytes=job.get("checked_bytes", 0) + len(chunk))
         if digest.digest() != check.digest():
             raise RuntimeError("Checksum mismatch: " + path)
         if times is not None:

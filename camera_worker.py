@@ -58,10 +58,30 @@ def identity(model, port, sysroot=Path("/sys/bus/usb/devices")):
     return None
 
 
-def discover(gp):
+def detect_ports(gp, exclude=(), only=None):
+    """Probe only concrete USB ports, never a wildcard covering a busy camera."""
+    ports = gp.PortInfoList()
+    ports.load()
+    selected = gp.PortInfoList()
+    # libgphoto2 append borrows PortInfo pointers but list_free owns them.
+    # Keep the loaded list as the sole owner. This tiny list allocation lives
+    # until this one-request worker exits; freeing it would double-free ports.
+    selected.thisown = False
+    for index in range(ports.count()):
+        info = ports[index]
+        path = info.get_path()
+        if USB_PORT.fullmatch(path) and path not in exclude and (only is None or path == only):
+            selected.append(info)
+    abilities = gp.CameraAbilitiesList()
+    abilities.load()
+    return list(abilities.detect(selected)) if selected.count() else []
+
+
+def discover(gp, exclude=(), only=None):
     devices = []
     seen = set()
-    for model, port in gp.Camera.autodetect():
+    found = detect_ports(gp, exclude, only) if exclude or only else gp.Camera.autodetect()
+    for model, port in found:
         device = identity(model, port)
         if device and port not in seen:
             seen.add(port)
@@ -75,7 +95,9 @@ def discover(gp):
 def open_camera(gp, device):
     if not isinstance(device, str) or not CAMERA_ID.fullmatch(device):
         raise ValueError("Invalid camera identifier")
-    found = next((d for d in discover(gp) if d["id"] == device), None)
+    match = CAMERA_ID.fullmatch(device)
+    port = f"usb:{match[1]},{match[2]}"
+    found = next((d for d in discover(gp, only=port) if d["id"] == device), None)
     if found is None:
         raise RuntimeError("Camera disconnected or changed. Refresh and select it again.")
     ports = gp.PortInfoList()
@@ -203,7 +225,10 @@ def main():
         raise ValueError("Invalid camera request")
     action = request.get("action")
     if action == "devices":
-        result = discover(gp)
+        excluded = request.get("exclude", [])
+        if not isinstance(excluded, list) or len(excluded) > 10 or any(not isinstance(p, str) or not USB_PORT.fullmatch(p) for p in excluded):
+            raise ValueError("Invalid excluded camera ports")
+        result = discover(gp, exclude=excluded)
     elif action in ("list", "stat", "download", "estimate"):
         path = request.get("path", "")
         components(path)

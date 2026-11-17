@@ -80,7 +80,7 @@ class UpdateTest(unittest.TestCase):
         self.assert_settings_retained()
 
     def test_active_transfer_blocks_service_stop(self):
-        for state in ('copying', 'resuming', 'finalizing'):
+        for state in ('queued', 'starting', 'counting', 'copying', 'resuming', 'finalizing'):
             with self.subTest(state=state):
                 self.history.write_text(json.dumps([{'state':state}]))
                 result = self.run_update()

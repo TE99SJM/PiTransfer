@@ -25,8 +25,8 @@ class Cameras:
             raise RuntimeError(result.stderr.strip()[:1000] or "Camera operation failed")
         return json.loads(result.stdout)
 
-    def devices(self):
-        return self.request("devices")
+    def devices(self, exclude=None):
+        return self.request("devices", exclude=exclude or [])
 
     def source(self, device):
         return CameraSource(self, device)

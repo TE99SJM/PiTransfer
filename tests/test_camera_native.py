@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from camera_worker import download, entries, file_info, estimate
+from camera_worker import download, entries, file_info, estimate, detect_ports
 
 try:
     import gphoto2 as gp
@@ -88,3 +88,19 @@ class NativeCameraTest(unittest.TestCase):
             result = estimate(gp, self.camera, ['DCIM', 'DCIM/photo.JPG'], lambda _: None)
         self.assertEqual(result['files'], 2)
         self.assertEqual(result['bytes'], 5 * 1024**3 + 8)
+
+    def test_filtered_native_port_lists_have_one_owner(self):
+        import gc
+        ports = gp.PortInfoList()
+        ports.load()
+        borrowed = gp.PortInfoList()
+        borrowed.thisown = False
+        expected = []
+        for i in range(ports.count()):
+            expected.append(ports[i].get_path())
+            borrowed.append(ports[i])
+        self.assertEqual([borrowed[i].get_path() for i in range(borrowed.count())], expected)
+        del borrowed
+        gc.collect()
+        self.assertEqual([ports[i].get_path() for i in range(ports.count())], expected)
+        self.assertEqual(detect_ports(gp, only='usb:999,999'), [])

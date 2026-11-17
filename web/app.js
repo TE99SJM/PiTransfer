@@ -1,10 +1,10 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let csrf = '', device = null, currentPath = '', offset = 0, nasReady = false, busy = false, polling = false;
-let selected = new Set(), devices = [];
+let selected = new Set(), devices = [], jobsState = [], jobsPolling = false;
 let sizing = false, serverSizing = false, preparing = false, sizeResult = null, sizeKey = '', sizeJobId = null, nasFree = null;
 let nasShare = '', nasFolder = '', nasBrowsePath = '', nasOffset = 0, nasLoading = false;
-const activeStates = new Set(['queued', 'copying', 'verifying', 'resuming', 'finalizing']);
+const activeStates = new Set(['queued', 'starting', 'counting', 'copying', 'verifying', 'resuming', 'finalizing']);
 const sizeStates = new Set(['queued', 'counting']);
 function node(tag, text, cls) { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; }
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -36,7 +36,11 @@ function controls() {
   for (const id of ['up', 'previous', 'next']) $(id).disabled = blocked;
   for (const input of $('files').querySelectorAll('input')) input.disabled = blocked || input.dataset.unsupported === 'true';
   for (const b of $('files').querySelectorAll('button')) b.disabled = blocked;
-  for (const b of $('drives').querySelectorAll('button')) b.disabled = blocked || b.dataset.usable === 'false';
+  for (const b of $('drives').querySelectorAll('button')) {
+    b.disabled = b.classList.contains('queue-device')
+      ? (!nasReady || sizing || serverSizing || preparing || jobsState.some(j=>j.device===b.dataset.device && activeStates.has(j.state)))
+      : (blocked || b.dataset.usable === 'false');
+  }
   for (const b of $('jobs').querySelectorAll('.resume-transfer')) b.disabled = blocked || !nasReady;
 }
 function invalidateSize() {
@@ -123,6 +127,12 @@ function renderDrives() {
     const row=node('div',undefined,'drive-actions');
     const choose=button(d.kind==='camera'?'Select camera':'Select drive',async()=>{ device=d.id; currentPath=''; offset=0; selected.clear(); invalidateSize(); await browse(); renderDrives(); }); choose.dataset.usable=String(d.usable); choose.disabled=!d.usable || locked();
     row.append(choose);
+    if(busy && d.usable) {
+      const queued=jobsState.some(j=>j.device===d.id && activeStates.has(j.state));
+      const queue=button(queued?'In transfer list':'Queue all files',()=>queueDevice(d),'secondary queue-device');
+      queue.dataset.device=d.id;queue.disabled=queued||!nasReady||preparing||sizing||serverSizing;
+      row.append(queue);
+    }
     if (d.mounted) { const eject=button('Unmount',async()=>{ const r=await api('eject',{device:d.id}); if(device===d.id) resetBrowser(); notice(r.message); await refresh(); }); eject.disabled=locked(); row.append(eject); }
     card.append(row); $('drives').append(card);
   }
@@ -145,22 +155,51 @@ async function browse() {
     $('files').append(row);
   });controls();
 }
+function jobProgress(j) {
+  const done=['complete','complete_with_skips'].includes(j.state), stopped=['failed','cancelled','interrupted'].includes(j.state);
+  const clamp=n=>Math.max(0,Math.min(done?100:99.9,n));
+  if(done) return {percent:100,title:'Complete',detail:`${bytes(j.bytes)} · ${j.files} files verified`};
+  if(j.state==='queued') return {percent:0,title:`Waiting${j.queue_position?' · queue position '+j.queue_position:''}`,detail:'Starts automatically after earlier transfers. Keep this device connected.'};
+  let percent=null,title='Preparing transfer',detail='';
+  if(j.state==='counting') {title='Counting files';detail=`${j.total_files||0} files · ${bytes(j.total_bytes||0)} found so far`;}
+  else if(j.phase==='rechecking' || (j.copy_complete && j.state==='resuming')) {
+    const total=j.phase_total ?? j.bytes, current=j.phase_bytes ?? j.reused_bytes ?? 0;
+    title='Rechecking saved data';detail=`${bytes(current)} of ${bytes(total)} checked`;
+    if(total>0) percent=clamp(current/total*100);
+  } else if(Number.isFinite(j.total_bytes) && j.total_bytes>0 && !j.unknown_files) {
+    title='Copying and verifying';detail=`${bytes(j.bytes)} of ${bytes(j.total_bytes)} copied · ${bytes(j.checked_bytes||0)} checked`;
+    percent=clamp((j.bytes+(j.checked_bytes||0))/(2*j.total_bytes)*100);
+  } else if(Number.isFinite(j.total_files) && j.total_files>0) {
+    title='Files verified';detail=`${j.files} of ${j.total_files} files · ${bytes(j.bytes)} copied · some sizes unknown`;
+    percent=clamp(j.files/j.total_files*100);
+  } else {title='Working · total size unknown';detail=`${bytes(j.bytes)} copied · ${j.files} files verified`;}
+  if(j.state==='finalizing') {title='Finishing transfer folder';percent=99.9;}
+  if(stopped) title=j.state==='failed'?'Needs attention':j.state==='cancelled'?'Cancelled':'Interrupted';
+  return {percent,title,detail,stopped};
+}
 function renderJobs(jobs) {
+  jobsState=jobs;
   busy=jobs.some(j=>activeStates.has(j.state));$('jobs').replaceChildren();
   if(!jobs.length) $('jobs').append(node('p','Your transfers will appear here.','empty'));
   for(const j of jobs){
-    const row=node('div',undefined,'job'), top=node('div',undefined,'job-top');
-    const date=new Date(j.created).toLocaleString();top.append(node('strong',date),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
+    const row=node('div',undefined,'job'), top=node('div',undefined,'job-top');row.dataset.jobId=j.id;
+    const date=new Date(j.created).toLocaleString(), label=j.device_label || devices.find(d=>d.id===j.device)?.label || (j.device?.startsWith('camera:')?'USB camera':'USB drive');
+    top.append(node('strong',label),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
+    row.append(node('p',`${date} · ${j.device_node || j.device}`,'path'));
+    const state=jobProgress(j), summary=node('div',undefined,'progress-heading');
+    summary.append(node('strong',state.title),node('span',state.percent===null?'':`${state.percent===100?'100':state.percent.toFixed(1)}%`));
+    row.append(summary);
+    const progress=node('progress',undefined,'transfer-progress');progress.max=100;
+    if(state.percent!==null || state.stopped) progress.value=state.percent??0;
+    progress.setAttribute('aria-label',`${label}: ${state.title}`);
+    progress.setAttribute('aria-valuetext',state.detail || state.title);row.append(progress,node('p',state.detail,'progress-detail'));
     row.append(node('p',`${j.files} files verified · ${bytes(j.bytes)} copied${j.skipped ? ' · '+j.skipped+' skipped':''}`));
     if(j.reused_files) row.append(node('p',`${j.reused_files} saved files rechecked · ${bytes(j.reused_bytes)} reused`));
     if(Number.isFinite(j.total_bytes)) {
       row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
-      if(!j.unknown_files && j.total_bytes > 0) {
-        const progress=node('progress');progress.max=j.total_bytes;progress.value=Math.min(j.bytes,j.total_bytes);progress.setAttribute('aria-label','Data copied; checksum verification continues separately');row.append(progress);
-      }
     }
     if(j.current)row.append(node('p',j.current,'path'));if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
-    if(activeStates.has(j.state))row.append(button('Cancel transfer',async()=>{await api('cancel',{id:j.id});notice('Cancellation requested. Waiting for the current disk operation to return.');},'danger'));
+    if(activeStates.has(j.state))row.append(button(j.state==='queued'?'Remove from queue':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
     if(j.can_resume) {
       row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
       row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
@@ -169,6 +208,15 @@ function renderJobs(jobs) {
     }
     $('jobs').append(row);
   }controls();
+}
+async function queueDevice(d) {
+  preparing=true;controls();
+  try {
+    if(!confirm(`Queue all accessible files from ${d.label} to a new folder inside ${destinationName()}?\nThe Pi copies one device at a time. Size is checked when this transfer starts. Keep the device connected. Originals stay unchanged.`)) return;
+    await api('queue',{device:d.id,destination_folder:nasFolder});
+    notice(`${d.label} added to the transfer queue. You can close this window.`);
+    await refresh();
+  } finally {preparing=false;controls();}
 }
 async function resumeTransfer(job) {
   preparing=true;controls();
@@ -243,3 +291,4 @@ $('nas-use').addEventListener('click',()=>act(async()=>{
 }));
 (async()=>{try{const s=await api('session');csrf=s.csrf;appView();await refresh();}catch(e){loginView();}})();
 setInterval(async()=>{if(!csrf||polling)return;polling=true;try{await refresh();}catch(e){notice(e.message);}finally{polling=false;}},5000);
+setInterval(async()=>{if(!csrf||jobsPolling||polling)return;jobsPolling=true;try{const r=await api('jobs');renderJobs(r.jobs);}catch(e){notice(e.message);}finally{jobsPolling=false;}},1000);
