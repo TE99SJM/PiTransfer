@@ -73,10 +73,10 @@ def main():
                     page.once('dialog', confirm)
                     page.locator('#copy-selected').click()
                     expect(page.locator('#notice')).to_contain_text('You can close this window', timeout=15000)
-                    expect(page.locator('#jobs')).to_contain_text('complete', timeout=15000)
+                    expect(page.locator('#jobs .job-top .pill').first).to_have_text('complete', timeout=15000)
                     assert len(dialogs) == 1
                     job = application.transfers.snapshot()[0]
-                    assert job['state'] == 'complete'
+                    assert job['state'] == 'complete', job
                     assert (hardware.dst/job['destination']/'data/DCIM/100GOPRO/photo.RAW').read_bytes() == b'raw'
                     expect(page.locator('#jobs')).to_contain_text('Estimated total: 2 file(s)')
 
