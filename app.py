@@ -109,14 +109,24 @@ class App:
     def route(self, path, method, data, env):
         if (method, path) == ("GET", "/api/status"):
             return {"devices": self.transfers.devices(), "nas": self.hardware.nas_status(),
-                    "jobs": self.transfers.snapshot(), "camera_error": getattr(self.hardware, "camera_error", "")}
+                    "jobs": self.transfers.snapshot(), "estimate": self.transfers.estimate_snapshot(),
+                    "camera_error": getattr(self.hardware, "camera_error", "")}
         if (method, path) == ("GET", "/api/jobs"):
             return {"jobs": self.transfers.snapshot()}
+        if (method, path) == ("POST", "/api/nas/browse"):
+            return self.transfers.browse_nas(data.get("path", ""), int(data.get("offset", 0)))
+        if (method, path) == ("GET", "/api/estimate"):
+            return {"estimate": self.transfers.estimate_snapshot()}
+        if (method, path) == ("POST", "/api/estimate"):
+            return self.transfers.estimate(data["device"], data["paths"])
+        if (method, path) == ("POST", "/api/estimate/cancel"):
+            self.transfers.cancel_estimate(data["id"])
+            return {"ok": True}
         # Browsing can mount a source read-only, so it is deliberately a CSRF-protected POST.
         if (method, path) == ("POST", "/api/browse"):
             return self.transfers.browse(data["device"], data.get("path", ""), int(data.get("offset", 0)))
         if (method, path) == ("POST", "/api/transfer"):
-            return self.transfers.start(data["device"], data["paths"])
+            return self.transfers.start(data["device"], data["paths"], data.get("estimate_id"), data.get("destination_folder", ""))
         if (method, path) == ("POST", "/api/eject"):
             return self.transfers.eject(data["device"])
         if (method, path) == ("POST", "/api/cancel"):

@@ -83,6 +83,45 @@ class WebTest(unittest.TestCase):
             self.assertEqual(self.request(endpoint, 'POST', {'device': DEVICE})['status'], 404)
         self.assertEqual(camera.opened, [])
 
+    def test_size_and_nas_browsing_require_login_and_csrf(self):
+        self.assertEqual(self.request('/api/estimate')['status'], 401)
+        self.assertEqual(self.request('/api/nas/browse', 'POST', {'path':''})['status'], 401)
+        self.login()
+        for endpoint, payload in (('/api/estimate', {'device':'usb','paths':['']}),
+                                  ('/api/nas/browse', {'path':''}),
+                                  ('/api/estimate/cancel', {'id':'none'})):
+            self.assertEqual(self.request(endpoint, 'POST', payload, HTTP_X_CSRF_TOKEN='wrong')['status'], 403)
+        (self.app.hardware.dst/'Video').mkdir()
+        response = self.request('/api/nas/browse', 'POST', {'path':''})
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(response['body']['items'], [{'name':'Video'}])
+
+    def test_started_copy_continues_after_browser_session_ends(self):
+        import threading
+        import time
+        from unittest.mock import patch
+        gate = threading.Event()
+        original = self.app.hardware.source
+        def delayed(device):
+            if not gate.wait(3):
+                raise RuntimeError('test gate timed out')
+            return original(device)
+        (self.app.hardware.src/'file.txt').write_bytes(b'copy in background')
+        self.login()
+        with patch.object(self.app.hardware, 'source', side_effect=delayed):
+            response = self.request('/api/transfer', 'POST', {'device':'usb','paths':['']})
+            self.assertEqual(response['status'], 200)
+            self.assertEqual(self.request('/api/logout', 'POST')['status'], 200)
+            gate.set()
+            deadline = time.monotonic()+3
+            while time.monotonic()<deadline:
+                if self.app.transfers.operation.acquire(False):
+                    self.app.transfers.operation.release()
+                    break
+                time.sleep(.005)
+        job = self.app.transfers.snapshot()[0]
+        self.assertEqual(job['state'], 'complete')
+        self.assertEqual((self.app.hardware.dst/job['destination']/'data/file.txt').read_bytes(), b'copy in background')
     def test_rate_limit_and_wrong_password(self):
         # Use a stub digest to keep repeated brute-force rejection testing quick.
         from unittest.mock import patch

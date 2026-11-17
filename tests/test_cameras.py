@@ -45,6 +45,19 @@ class FakeCamera:
             return {"kind": "folder"}
         return {"kind": "file", "size": None if self.unknown_size else len(self.files[path]), "mtime": 1700000000}
 
+    def estimate(self, paths, check, progress):
+        totals = {"bytes": 0, "files": 0, "unknown_files": 0, "skipped": 0}
+        for name, content in self.files.items():
+            check()
+            if any(path == "" or name == path or name.startswith(path + "/") for path in paths):
+                totals["files"] += 1
+                if self.unknown_size:
+                    totals["unknown_files"] += 1
+                else:
+                    totals["bytes"] += len(content)
+                progress(totals)
+        progress(totals)
+
     @contextlib.contextmanager
     def stream(self, path, expected, check):
         self.opened.append(path)

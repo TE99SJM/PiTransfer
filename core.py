@@ -19,6 +19,7 @@ DIRECTORY = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 READ = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 WRITE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 ACTIVE = {"queued", "copying", "verifying"}
+ESTIMATING = {"queued", "counting"}
 
 
 def parts(path):
@@ -30,6 +31,17 @@ def parts(path):
     if any(p in ("", ".", "..") for p in result):
         raise ValueError("Invalid path")
     return result
+
+
+def selection(device, paths):
+    if not isinstance(paths, list) or not paths or len(paths) > 200:
+        raise ValueError("Choose up to 200 files or folders, or copy all files.")
+    for path in paths:
+        parts(path)
+        if isinstance(device, str) and device.startswith("camera:"):
+            camera_parts(path)
+    paths = sorted(set(paths))
+    return [p for p in paths if not any(p != q and (q == "" or p.startswith(q + "/")) for q in paths)]
 
 
 @contextlib.contextmanager
@@ -62,6 +74,28 @@ def listing(root_fd, path="", offset=0):
             kind = "folder" if stat.S_ISDIR(s.st_mode) else "file" if stat.S_ISREG(s.st_mode) else "unsupported"
             items.append({"name": entry.name, "kind": kind, "size": s.st_size if kind == "file" else None})
     return {"items": items, "more": more, "offset": offset}
+
+
+def folder_listing(root_fd, path="", offset=0):
+    """NAS directories only; never opens or returns regular-file contents."""
+    parts(path)
+    if type(offset) is not int or not 0 <= offset <= 10000000:
+        raise ValueError("Invalid offset")
+    items, seen, more = [], 0, False
+    with directory(root_fd, path) as fd, os.scandir(fd) as entries:
+        for entry in entries:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if seen < offset:
+                seen += 1
+                continue
+            if len(items) == 200:
+                more = True
+                break
+            items.append({"name": entry.name})
+        space = os.fstatvfs(fd)
+    return {"items": items, "more": more, "offset": offset, "path": path,
+            "free": space.f_bavail * space.f_frsize}
 
 
 class Hardware:
@@ -124,7 +158,8 @@ class Hardware:
             fd = self.nas()
             try:
                 v = os.fstatvfs(fd)
-                return {"ready": True, "free": v.f_bavail * v.f_frsize, "destination": self.config["nas_share"] + "/Pi-Imports"}
+                return {"ready": True, "free": v.f_bavail * v.f_frsize, "share": self.config["nas_share"],
+                        "destination": self.config["nas_share"] + "/Pi-Imports"}
             finally:
                 os.close(fd)
         except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
@@ -144,6 +179,8 @@ class Transfers:
         self.cancel_event = threading.Event()
         self.device_cache = []
         self.device_cache_time = 0
+        self.size_job = None
+        self.size_cancel = threading.Event()
         try:
             self.jobs = json.loads(self.history_path.read_text())[-30:]
         except (OSError, ValueError):
@@ -201,21 +238,119 @@ class Transfers:
         finally:
             self.operation.release()
 
-    def start(self, device, paths):
-        if not isinstance(paths, list) or not paths or len(paths) > 200:
-            raise ValueError("Choose up to 200 files or folders, or copy the entire drive.")
-        paths = sorted(set(paths))
-        for p in paths:
-            parts(p)
-            if isinstance(device, str) and device.startswith("camera:"):
-                camera_parts(p)
-        # Parent selection already includes its descendants.
-        paths = [p for p in paths if not any(p != q and (q == "" or p.startswith(q + "/")) for q in paths)]
+    def estimate_snapshot(self):
+        with self.lock:
+            return dict(self.size_job, paths=list(self.size_job["paths"])) if self.size_job else None
+
+    def browse_nas(self, path, offset=0):
+        fd = self.hardware.nas()
+        try:
+            return folder_listing(fd, path, offset)
+        finally:
+            os.close(fd)
+
+    def estimate(self, device, paths):
+        paths = selection(device, paths)
+        if not self.operation.acquire(blocking=False):
+            raise RuntimeError("Wait for the current copy, browse, or size calculation to finish.")
+        try:
+            with self.lock:
+                job = {"id": uuid.uuid4().hex, "device": device, "paths": paths, "state": "queued",
+                       "bytes": 0, "files": 0, "unknown_files": 0, "skipped": 0}
+                self.size_job = job
+                self.size_cancel.clear()
+            threading.Thread(target=self.run_estimate, args=(job,), daemon=True).start()
+        except Exception:
+            self.operation.release()
+            raise
+        return dict(job)
+
+    def cancel_estimate(self, job_id):
+        with self.lock:
+            if not self.size_job or self.size_job["id"] != job_id:
+                raise ValueError("No matching size calculation")
+            if self.size_job["state"] in ESTIMATING:
+                self.size_cancel.set()
+
+    def run_estimate(self, job):
+        def check():
+            if self.size_cancel.is_set():
+                raise Cancelled("Size calculation cancelled. No files were copied.")
+        def progress(totals):
+            check()
+            self.update(job, **{key: totals[key] for key in ("bytes", "files", "unknown_files", "skipped")})
+        outcome = {"state": "complete"}
+        try:
+            self.update(job, state="counting")
+            check()
+            if isinstance(job["device"], str) and job["device"].startswith("camera:"):
+                self.hardware.camera_source(job["device"]).estimate(job["paths"], check, progress)
+            else:
+                fd = self.hardware.source(job["device"])
+                try:
+                    self.estimate_disk(fd, job["paths"], check, progress)
+                finally:
+                    os.close(fd)
+            check()
+        except Cancelled as exc:
+            outcome = {"state": "cancelled", "error": str(exc)}
+        except Exception as exc:
+            outcome = {"state": "failed", "error": str(exc)[:800]}
+        finally:
+            with self.lock:
+                job.update(outcome, completed_at=time.time())
+                self.operation.release()
+
+    @staticmethod
+    def estimate_disk(root_fd, paths, check, progress):
+        totals = {"bytes": 0, "files": 0, "unknown_files": 0, "skipped": 0}
+        def walk(fd, depth):
+            if depth > 64:
+                raise ValueError("Directory nesting exceeds 64 levels")
+            with os.scandir(fd) as entries:
+                for entry in entries:
+                    visit(fd, entry.name, depth)
+        def visit(fd, name, depth):
+            check()
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                with directory(fd, name) as child:
+                    walk(child, depth + 1)
+            elif stat.S_ISREG(info.st_mode):
+                totals["files"] += 1
+                totals["bytes"] += info.st_size
+            else:
+                totals["skipped"] += 1
+            progress(totals)
+        for path in paths:
+            check()
+            names = parts(path)
+            if not names:
+                walk(root_fd, 0)
+            else:
+                with directory(root_fd, "/".join(names[:-1])) as parent:
+                    visit(parent, names[-1], len(names) - 1)
+        progress(totals)
+
+    def start(self, device, paths, estimate_id=None, destination_folder=""):
+        paths = selection(device, paths)
+        parts(destination_folder)
+        estimate = None
+        if estimate_id is not None:
+            estimate = self.estimate_snapshot()
+            if (not estimate or estimate["id"] != estimate_id or estimate["state"] != "complete"
+                    or estimate["device"] != device or estimate["paths"] != paths
+                    or time.time() - estimate["completed_at"] > 300):
+                raise ValueError("Size estimate changed or expired. Calculate the size again.")
         if not self.operation.acquire(blocking=False):
             raise RuntimeError("A drive operation is already in progress.")
         try:
             with self.lock:
                 job = {"id": uuid.uuid4().hex[:12], "device": device, "state": "queued", "created": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "files": 0, "bytes": 0, "skipped": 0, "current": "", "destination": ""}
+                job["destination_folder"] = destination_folder
+                if estimate:
+                    job.update(total_bytes=estimate["bytes"], total_files=estimate["files"],
+                               unknown_files=estimate["unknown_files"])
                 self.jobs = self.jobs[-29:] + [job]
                 self.cancel_event.clear()
                 self.save()
@@ -250,11 +385,17 @@ class Transfers:
                     stack.callback(os.close, src)
                 nas = self.hardware.nas()
                 stack.callback(os.close, nas)
+                # Pin the chosen directory inside the verified NAS mount.
+                target = stack.enter_context(directory(nas, job.get("destination_folder", "")))
+                if "total_bytes" in job:
+                    self.check_space(target, job["total_bytes"])
                 try:
-                    os.mkdir("Pi-Imports", 0o700, dir_fd=nas)
+                    os.mkdir("Pi-Imports", 0o700, dir_fd=target)
                 except FileExistsError:
                     pass
-                imports = stack.enter_context(directory(nas, "Pi-Imports"))
+                imports = stack.enter_context(directory(target, "Pi-Imports"))
+                prefix = job.get("destination_folder", "")
+                prefix = (prefix + "/" if prefix else "") + "Pi-Imports/"
                 stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + job["id"]
                 incomplete = ".incomplete-" + stamp
                 os.mkdir(incomplete, 0o700, dir_fd=imports)
@@ -262,7 +403,7 @@ class Transfers:
                 os.mkdir("data", 0o700, dir_fd=dest)
                 data = stack.enter_context(directory(dest, "data"))
                 manifest = stack.enter_context(os.fdopen(os.open("checksums.jsonl", WRITE, 0o600, dir_fd=dest), "w", encoding="utf-8"))
-                self.update(job, state="copying", destination="Pi-Imports/" + incomplete)
+                self.update(job, state="copying", destination=prefix + incomplete)
                 with self.lock:
                     self.save()
                 for path in paths:
@@ -293,7 +434,7 @@ class Transfers:
                 # Commit only after every selected regular file has passed read-back.
                 final = "transfer-" + stamp
                 os.rename(incomplete, final, src_dir_fd=imports, dst_dir_fd=imports)
-                self.update(job, state="complete_with_skips" if job["skipped"] else "complete", current="", destination="Pi-Imports/" + final)
+                self.update(job, state="complete_with_skips" if job["skipped"] else "complete", current="", destination=prefix + final)
         except Cancelled as exc:
             self.update(job, state="cancelled", error=str(exc))
         except Exception as exc:

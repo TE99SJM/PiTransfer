@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from camera_worker import download, entries, file_info
+from camera_worker import download, entries, file_info, estimate
 
 try:
     import gphoto2 as gp
@@ -78,3 +78,13 @@ class NativeCameraTest(unittest.TestCase):
         expected["size"] += 1
         with self.assertRaisesRegex(RuntimeError, "changed before"):
             download(gp, self.camera, "photo.RAW", expected)
+
+    def test_recursive_file_sizes_use_metadata_only(self):
+        (self.root / 'DCIM').mkdir()
+        (self.root / 'DCIM/photo.JPG').write_bytes(b'12345')
+        with (self.root / 'DCIM/big.MP4').open('wb') as f:
+            f.truncate(5 * 1024**3 + 3)
+        with patch('camera_worker.download', side_effect=AssertionError('Downloaded media')):
+            result = estimate(gp, self.camera, ['DCIM', 'DCIM/photo.JPG'], lambda _: None)
+        self.assertEqual(result['files'], 2)
+        self.assertEqual(result['bytes'], 5 * 1024**3 + 8)

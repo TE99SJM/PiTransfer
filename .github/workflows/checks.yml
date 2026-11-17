@@ -11,7 +11,7 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -31,3 +31,9 @@ jobs:
         run: |
           /usr/bin/python3 -c 'import gphoto2'
           /usr/bin/python3 -m unittest tests.test_camera_native -v
+      - name: Install browser test tools
+        run: |
+          python3 -m pip install playwright==1.62.0
+          python3 -m playwright install --with-deps chromium
+      - name: Check browser transfer flow
+        run: python3 tests/browser_flow.py

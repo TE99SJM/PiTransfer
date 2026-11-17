@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import resource
 import sys
+import time
 
 USB_PORT = re.compile(r"usb:([0-9]{3}),([0-9]{3})\Z")
 CAMERA_ID = re.compile(r"camera:([0-9]{3}):([0-9]{3}):[0-9a-f]{16}\Z")
@@ -129,6 +130,40 @@ def stat_path(gp, camera, path):
     return {"kind": "folder"} if entry["kind"] == "folder" else file_info(gp, camera, path)
 
 
+def estimate(gp, camera, paths, emit):
+    if not isinstance(paths, list) or not paths or len(paths) > 200:
+        raise ValueError("Invalid camera selection")
+    for path in paths:
+        components(path)
+    paths = sorted(set(paths))
+    paths = [p for p in paths if not any(p != q and (q == "" or p.startswith(q + "/")) for q in paths)]
+    totals = {"bytes": 0, "files": 0, "unknown_files": 0, "skipped": 0}
+    last = [0.0]
+    def count(path, kind):
+        components(path)
+        if kind == "folder":
+            for entry in entries(camera, path):
+                child = path + "/" + entry["name"] if path else entry["name"]
+                count(child, entry["kind"])
+        else:
+            info = file_info(gp, camera, path)
+            totals["files"] += 1
+            if info["size"] is None:
+                totals["unknown_files"] += 1
+            elif info["size"] < 0:
+                raise ValueError("Camera returned an invalid file size")
+            else:
+                totals["bytes"] += info["size"]
+        now = time.monotonic()
+        if now - last[0] >= .2:
+            emit(dict(totals))
+            last[0] = now
+    emit(dict(totals))
+    for path in paths:
+        count(path, stat_path(gp, camera, path)["kind"])
+    return totals
+
+
 def download(gp, camera, path, expected):
     before = file_info(gp, camera, path)
     if before != expected:
@@ -163,13 +198,13 @@ def main():
     version = tuple(int(x) for x in gp.__version__.split(".")[:2])
     if version < (2, 5):
         raise RuntimeError("Camera streaming requires python3-gphoto2 2.5 or newer (Raspberry Pi OS/Debian Trixie). USB drives still work.")
-    request = json.loads(sys.stdin.buffer.read(65537))
+    request = json.loads(sys.stdin.buffer.read(1024 * 1024 + 1))
     if not isinstance(request, dict):
         raise ValueError("Invalid camera request")
     action = request.get("action")
     if action == "devices":
         result = discover(gp)
-    elif action in ("list", "stat", "download"):
+    elif action in ("list", "stat", "download", "estimate"):
         path = request.get("path", "")
         components(path)
         with open_camera(gp, request.get("device")) as camera:
@@ -182,6 +217,10 @@ def main():
                           "more": len(items) > offset + 200}
             elif action == "stat":
                 result = stat_path(gp, camera, path)
+            elif action == "estimate":
+                result = estimate(gp, camera, request["paths"],
+                                  lambda totals: print(json.dumps(totals), flush=True))
+                result["complete"] = True
             else:
                 download(gp, camera, path, request["expected"])
                 return

@@ -31,15 +31,18 @@ class Cameras:
     def source(self, device):
         return CameraSource(self, device)
 
-    @contextlib.contextmanager
     def stream(self, device, path, expected, check):
+        return self.stream_request({"action": "download", "device": device,
+                                    "path": path, "expected": expected}, check)
+
+    @contextlib.contextmanager
+    def stream_request(self, request, check):
         process = subprocess.Popen(self.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE)
         try:
-            process.stdin.write(json.dumps({"action": "download", "device": device,
-                                           "path": path, "expected": expected}).encode())
+            process.stdin.write(json.dumps(request).encode())
             process.stdin.close()
-            yield self._chunks(process, check)
+            yield self._chunks(process, check, request.get("action") == "estimate")
         finally:
             if process.poll() is None:
                 process.kill()
@@ -47,7 +50,7 @@ class Cameras:
             for pipe in (process.stdin, process.stdout, process.stderr):
                 pipe.close()
 
-    def _chunks(self, process, check):
+    def _chunks(self, process, check, estimating=False):
         error = bytearray()
         deadline = time.monotonic() + self.idle_timeout
         with selectors.DefaultSelector() as selector:
@@ -56,7 +59,8 @@ class Cameras:
             while selector.get_map():
                 check()
                 if time.monotonic() > deadline:
-                    raise RuntimeError("Camera transfer stalled. Incomplete NAS copy retained.")
+                    raise RuntimeError("Camera size calculation stalled. No files were copied." if estimating else
+                                       "Camera transfer stalled. Incomplete NAS copy retained.")
                 for key, _ in selector.select(timeout=0.25):
                     chunk = os.read(key.fileobj.fileno(), 1024 * 1024)
                     if not chunk:
@@ -70,14 +74,16 @@ class Cameras:
             while process.poll() is None:
                 check()
                 if time.monotonic() > deadline:
-                    raise RuntimeError("Camera did not finish its transfer")
+                    raise RuntimeError("Camera did not finish its size calculation" if estimating else
+                                       "Camera did not finish its transfer")
                 try:
                     process.wait(timeout=0.25)
                 except subprocess.TimeoutExpired:
                     pass
         if process.returncode:
             raise RuntimeError(error.decode("utf-8", errors="replace").strip() or
-                               "Camera disconnected or its driver failed. Incomplete NAS copy retained.")
+                               ("Camera disconnected or its driver failed during size calculation." if estimating else
+                                "Camera disconnected or its driver failed. Incomplete NAS copy retained."))
 
 
 class CameraSource:
@@ -89,6 +95,24 @@ class CameraSource:
 
     def stat(self, path):
         return self.backend.request("stat", device=self.device, path=path)
+
+    def estimate(self, paths, check, progress):
+        pending = b""
+        complete = False
+        with self.backend.stream_request({"action": "estimate", "device": self.device, "paths": paths}, check) as chunks:
+            for chunk in chunks:
+                pending += chunk
+                while b"\n" in pending:
+                    line, pending = pending.split(b"\n", 1)
+                    totals = json.loads(line)
+                    if any(type(totals.get(k)) is not int or totals[k] < 0 for k in ("bytes", "files", "unknown_files", "skipped")):
+                        raise ValueError("Invalid camera size metadata")
+                    complete = totals.get("complete") is True
+                    progress(totals)
+                if len(pending) > 65536:
+                    raise ValueError("Invalid camera size response")
+        if pending or not complete:
+            raise RuntimeError("Camera size calculation did not finish")
 
     def stream(self, path, expected, check):
         return self.backend.stream(self.device, path, expected, check)

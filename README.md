@@ -8,11 +8,25 @@ A small, headless Raspberry Pi web app for copying files from USB drives and sup
 
 - Detects USB disks, flash drives, USB SD-card readers, and libgphoto2-supported MTP/PTP cameras, refreshing every five seconds while idle.
 - Displays filenames and folders, with sizes for disk files. Camera browsing lists names without downloading media or thumbnails. Select files/folders or copy all accessible files.
+- Calculates selected/all-file counts and data totals from metadata before copy confirmation. Shows unknown camera sizes explicitly and lets you cancel counting.
+- Browses folders exposed by the configured NAS share and lets you choose a destination beneath it.
 - Shows copied bytes, verified file counts, current filename and recent transfers.
 - Allows cancellation and unmounting after transfers.
 - Does **not** preview, play, download, upload, edit, execute or delete files.
 
 The backend must read file bytes to copy and verify them; it never sends those bytes to the browser. Directory browsing returns metadata only. This is a transfer station, not an antivirus scanner or an air gap.
+
+## Size and destination controls
+
+Use **Browse** beside a source folder to reach individual files. A folder checkbox selects that whole subtree for copying. Select the items you want, then choose **Check size** to count them and total their current sizes. With no selection, Check size counts all accessible files on the selected device. Folder/child selections are deduplicated. Symlinks and special files are excluded and counted as skipped. **Copy selected** and **Copy all files** also calculate the size before displaying their confirmation; calculating alone never starts a copy.
+
+Large cameras may take time to enumerate. The count runs in a background worker, can be cancelled, and locks source operations until finished. It reads names and file-size metadata without requesting media, thumbnails or previews. A missing camera-reported size is displayed as unknown alongside the known byte total. Completed estimates are snapshots, not guarantees that a source will remain unchanged. Job history shows the estimated total beside copied bytes; the progress bar measures copied data, while the job state separately indicates checksum verification. Estimates are rechecked against destination free space, and copying still checks each file's space requirements.
+
+Choose **Choose NAS folder** to list the folders visible through your configured MNAS/SMB share. Browse into a folder, use **Parent folder** to go back, and select **Use this folder**. Mounted folders are visible only if the NAS exports them through this share and your NAS account has access. PiTransfer cannot enumerate other server mounts or shares outside that connection. Only folders are returned; existing NAS file contents are never served. The folder choice is for this browser page; reloading starts at the share root again. Running transfers retain their chosen destination.
+
+Each transfer creates a separate verified import below the chosen folder, for example `Video/Pi-Imports/transfer-.../data/`. Existing NAS files are not replaced. An absent, inaccessible or symlinked destination fails instead of falling back to another location.
+
+**Once a transfer starts, it continues on the Pi after the browser window closes or the phone locks.** Reopen the app to check progress. The Pi, source device, NAS and network must remain available. Closing the page while only calculating sizes does not approve or start a transfer. Restarting the Pi/service interrupts the transfer and retains its incomplete folder; copies do not automatically resume.
 
 ## Transfer behavior
 
@@ -23,7 +37,7 @@ Camera sources use libgphoto2 read operations under the unprivileged service acc
 Each copy gets its own folder:
 
 ```
-NAS share / Pi-Imports / transfer-UTCtimestamp-randomID /
+NAS share / chosen-folder (optional) / Pi-Imports / transfer-UTCtimestamp-randomID /
   data/               copied files and folders
   checksums.jsonl     SHA-256 and verification result for each file
 ```
@@ -92,7 +106,9 @@ The service intentionally allows its small root-owned helper through a constrain
 
 Run `python3 -m unittest discover -s tests -v` in this folder. Tests exercise real temporary-file copies, checksum mismatch detection, cancellation, failure handling, path/symlink containment, source preservation, exclusive destinations, device filtering and HTTP authorization. Camera tests cover metadata-only browsing, recursive/paginated transfers, RAW/video/sidecar objects, unknown sizes, truncation, disconnects, source swaps, subprocess timeouts and cancellation, and the absence of media-serving endpoints. They need no root access or NAS. Install `python3-gphoto2` and run `/usr/bin/python3 -m unittest tests.test_camera_native -v` for the additional native tests; CI runs these explicitly.
 
-The camera update has 60 automated tests, including three native-binding tests using libgphoto2's Directory Browse test driver and three updater tests for settings preservation, active-transfer refusal, and rollback. Production discovery rejects the non-USB test driver. Native tests have passed with python-gphoto2 2.5.1 and 2.6.4; they prove the adapter can stream original bytes through a real fd-backed CameraFile, but do **not** prove hardware compatibility for an individual camera. Physical camera/USB transfers, ARM installation, udev permissions, NAS encryption negotiation, unplug behavior and transfer speed still require testing on your Pi and NAS. Unit tests do not substitute for those hardware checks. A readable malicious filesystem or USB protocol still reaches its respective driver; keep the Pi OS and camera libraries updated.
+There are 78 automated unit/integration tests, including four native-binding tests using libgphoto2's Directory Browse test driver and three updater tests for settings preservation, active-transfer refusal, and rollback. Size tests include files larger than 4 GiB without reading their contents. NAS tests cover folder pagination, selected destinations and traversal/symlink refusal. A web test verifies that ending a browser session does not stop an already-started copy. Production discovery rejects the non-USB test driver. Native tests prove library integration, but do **not** prove hardware compatibility for every camera. Physical camera/USB transfers, ARM installation, udev permissions, NAS encryption negotiation, unplug behavior and transfer speed still require testing on your Pi and NAS. A readable malicious filesystem or USB protocol still reaches its respective driver; keep the Pi OS and camera libraries updated.
+
+CI also runs `python3 tests/browser_flow.py` with Playwright/Chromium against a temporary fake camera and NAS. It checks destination selection, size display, unknown sizes, cancellation, copy confirmation, actual output files, and mobile viewport width. This browser test uses no real NAS or USB hardware.
 
 ## Technical references
 
@@ -103,4 +119,4 @@ The camera update has 60 automated tests, including three native-binding tests u
 - [python-gphoto2 bindings and file APIs](https://github.com/jim-easterbrook/python-gphoto2)
 - [GoPro USB connection troubleshooting](https://community.gopro.com/s/article/Camera-is-not-Recognized-when-Plugged-into-a-Computer-USB-Port?language=en_US)
 
-Version: 0.2.0
+Version: 0.3.0
