@@ -99,14 +99,21 @@ def start(engine, token, confirmation):
             job=choose(engine,request['job_id'])
             engine.cancel_event.clear()
             job['cleanup_previous_state']=job['state']
-            job.update(state='deleting',cleanup={'state':'checking','files':0,'total_files':request['count'],
+            job.update(state='deleting',cleanup={'state':'checking','device':request['device'],'files':0,'total_files':request['count'],
                                                 'bytes':0,'phase_bytes':0,'error':'','current':''})
             engine.active_job=job
             engine.save()
         threading.Thread(target=run,args=(engine,job,request),daemon=True).start()
         return dict(job)
     except Exception:
-        engine.release_operation(transfer=True)
+        with engine.lock:
+            if 'job' in locals() and job.get('state') == 'deleting':
+                job['state']=job.pop('cleanup_previous_state','complete')
+                job['cleanup'].update(state='failed',error='Deletion could not start; originals were kept')
+                try: engine.save()
+                finally: engine.release_operation(transfer=True)
+            else:
+                engine.release_operation(transfer=True)
         raise
 
 

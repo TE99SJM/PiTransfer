@@ -126,6 +126,28 @@ class CleanupTest(unittest.TestCase):
         result=self.delete(job);self.assertEqual(result['cleanup']['state'],'failed');self.assertEqual(len(self.camera.files),2)
         self.assertEqual(outside.read_bytes(),b'first')
 
+    def test_reconnected_camera_deletion_excludes_actual_active_usb_port(self):
+        from unittest.mock import Mock
+        job=self.copy();replacement='camera:004:009:aaaaaaaaaaaaaaaa'
+        active=self.engine.jobs[-1];active.update(state='deleting',cleanup={'device':replacement})
+        self.engine.active_job=active
+        self.hw.devices=Mock(return_value=[])
+        self.engine.device_cache_time=0
+        self.engine.devices()
+        self.hw.devices.assert_called_once_with(exclude=['usb:004,009'])
+        self.assertEqual(self.engine.snapshot()[0]['active_device'],replacement)
+        active['state']='complete';self.engine.active_job=None
+
+    def test_disk_deletion_discovery_uses_cache_instead_of_waiting_on_mount_lock(self):
+        from unittest.mock import Mock
+        job=self.copy();active=self.engine.jobs[-1]
+        active.update(state='deleting',cleanup={'device':'8:1:0123456789abcdef'})
+        self.engine.active_job=active;self.engine.device_cache_time=0
+        self.hw.devices=Mock(side_effect=AssertionError('Would block on helper lock'))
+        self.assertEqual(self.engine.devices(),[])
+        self.hw.devices.assert_not_called();self.assertFalse(self.engine.discovering)
+        active['state']='complete';self.engine.active_job=None
+
 
 class CameraDeleteProtocolTest(unittest.TestCase):
     def setUp(self):

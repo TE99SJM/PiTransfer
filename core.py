@@ -257,11 +257,15 @@ class Transfers:
     def snapshot(self):
         with self.lock:
             positions = {j[0]["id"]: i + 1 for i, j in enumerate(self.queue)}
-            return [dict(j, can_resume=bool(self.resume_mode(j)),
+            return [dict(j, can_resume=bool(self.resume_mode(j)), active_device=self.job_device(j),
                          can_delete=j["state"] in {"complete", "complete_with_skips"} and j["files"] > 0 and j.get("cleanup", {}).get("state") != "complete",
                          can_organize=j["state"] in {"complete", "complete_with_skips"} and j.get("layout") != "camera_date",
                          queue_position=positions.get(j["id"], 0),
                          resume_needs_source=self.resume_mode(j) == "copy") for j in reversed(self.jobs)]
+
+    @staticmethod
+    def job_device(job):
+        return job.get("cleanup", {}).get("device", job["device"]) if job.get("state") == "deleting" else job.get("device")
 
     def acquire_operation(self):
         with self.lock:
@@ -363,15 +367,21 @@ class Transfers:
                 return list(self.device_cache)
             self.discovering = True
             active = self.active_job
+            active_device = self.job_device(active) if active else None
+            if active and active.get("state") == "deleting" and not str(active_device).startswith("camera:"):
+                # The disk helper holds its mount lock throughout verification.
+                # Do not block status threads behind a multi-GB checksum read.
+                self.discovering = False
+                return list(self.device_cache)
             excluded = []
-            if active and str(active["device"]).startswith("camera:"):
-                token = active["device"].split(":")
+            if active and str(active_device).startswith("camera:"):
+                token = active_device.split(":")
                 excluded = [f"usb:{token[1]},{token[2]}"]
         try:
             found = self.hardware.devices(exclude=excluded) if excluded else self.hardware.devices()
             with self.lock:
                 if excluded:
-                    found += [d for d in self.device_cache if d["id"] == active["device"] and not any(f["id"] == d["id"] for f in found)]
+                    found += [d for d in self.device_cache if d["id"] == active_device and not any(f["id"] == d["id"] for f in found)]
                 self.device_cache = found
                 self.device_cache_time = time.monotonic()
                 return list(self.device_cache)
@@ -516,7 +526,7 @@ class Transfers:
                 raise RuntimeError("A drive operation is already in progress. Use Queue all files for another device.")
             if len(self.queue) >= 10:
                 raise RuntimeError("The queue is full (10 waiting transfers).")
-            if any(j["device"] == device and j["state"] in ACTIVE for j in self.jobs):
+            if any(self.job_device(j) == device and j["state"] in ACTIVE for j in self.jobs):
                 raise RuntimeError("This device already has an active or queued transfer.")
             source = next((d for d in self.device_cache if d["id"] == device), None)
             if enqueue and (not source or not source.get("usable")):

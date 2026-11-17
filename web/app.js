@@ -39,7 +39,7 @@ function controls() {
   for (const b of $('files').querySelectorAll('button')) b.disabled = blocked;
   for (const b of $('drives').querySelectorAll('button')) {
     b.disabled = b.classList.contains('queue-device')
-      ? (!nasReady || sizing || serverSizing || preparing || jobsState.some(j=>j.device===b.dataset.device && activeStates.has(j.state)))
+      ? (!nasReady || sizing || serverSizing || preparing || jobsState.some(j=>(j.active_device||j.device)===b.dataset.device && activeStates.has(j.state)))
       : (blocked || b.dataset.usable === 'false');
   }
   for (const b of $('jobs').querySelectorAll('.resume-transfer, .delete-originals, .organize-transfer')) b.disabled = blocked || !nasReady;
@@ -129,7 +129,7 @@ function renderDrives() {
     const choose=button(d.kind==='camera'?'Select camera':'Select drive',async()=>{ device=d.id; currentPath=''; offset=0; selected.clear(); invalidateSize(); await browse(); renderDrives(); }); choose.dataset.usable=String(d.usable); choose.disabled=!d.usable || locked();
     row.append(choose);
     if(busy && d.usable) {
-      const queued=jobsState.some(j=>j.device===d.id && activeStates.has(j.state));
+      const queued=jobsState.some(j=>(j.active_device||j.device)===d.id && activeStates.has(j.state));
       const queue=button(queued?'In transfer list':'Queue all files',()=>queueDevice(d),'secondary queue-device');
       queue.dataset.device=d.id;queue.disabled=queued||!nasReady||preparing||sizing||serverSizing;
       row.append(queue);
