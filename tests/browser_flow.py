@@ -226,8 +226,11 @@ def main():
                     camera.delete_verified=gated_delete
                     try:
                         page.once('dialog',confirm_delete)
-                        delete.click();assert started.wait(5)
-                        expect(copied_card.locator('.cleanup-status')).to_contain_text('Verifying originals')
+                        delete.click()
+                        # Keep Playwright's event loop running to handle the async
+                        # confirmation dialog before waiting on the worker gate.
+                        expect(copied_card.locator('.cleanup-status')).to_contain_text('Verifying originals',timeout=15000)
+                        assert started.is_set()
                         expect(copied_card.locator('.copy-progress')).to_have_attribute('value','100')
                         expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
                         expect(copied_card.locator('.verification-progress')).to_have_js_property('value',len(camera.files['DCIM/100GOPRO/clip.MP4'])//2/(2*(len(camera.files['DCIM/100GOPRO/clip.MP4'])+3))*100)
