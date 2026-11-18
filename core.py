@@ -132,7 +132,7 @@ class Hardware:
         mounted = self.helper("mount", device)
         return os.open(mounted["path"], DIRECTORY)
 
-    def delete_verified(self, device, entry, check, progress):
+    def delete_verified(self, device, entry, check, progress, verified=None):
         if not isinstance(device,str) or not re.fullmatch(r"[0-9]+:[0-9]+:[0-9a-f]{16}",device):
             raise ValueError("Invalid device")
         request={k:entry[k] for k in ("path","size","sha256","backup_path")}
@@ -150,6 +150,7 @@ class Hardware:
                     if set(response)=={"bytes"} and type(response["bytes"]) is int and response["bytes"]>=0:
                         progress(response["bytes"])
                     elif response=={"ready":True} and not authorized:
+                        if verified is not None: verified()
                         check()
                         process.stdin.write(b'{"delete":true}\n');process.stdin.flush()
                         authorized=True;process.stdin.close()
@@ -257,7 +258,7 @@ class Transfers:
     def snapshot(self):
         with self.lock:
             positions = {j[0]["id"]: i + 1 for i, j in enumerate(self.queue)}
-            return [dict(j, can_resume=bool(self.resume_mode(j)), active_device=self.job_device(j),
+            return [dict(dict(j, cleanup=dict(j["cleanup"])) if "cleanup" in j else j, can_resume=bool(self.resume_mode(j)), active_device=self.job_device(j),
                          can_delete=j["state"] in {"complete", "complete_with_skips"} and j["files"] > 0 and j.get("cleanup", {}).get("state") != "complete",
                          can_organize=j["state"] in {"complete", "complete_with_skips"} and j.get("layout") != "camera_date",
                          queue_position=positions.get(j["id"], 0),

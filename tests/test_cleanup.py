@@ -5,12 +5,13 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 
 from camera import Cameras
-from core import Transfers, Cancelled
+from core import Transfers, Cancelled, Hardware
 import drive_helper as helper
 from tests.test_cameras import DEVICE, FakeCamera
 from tests.test_transfer import FakeHardware
@@ -84,6 +85,7 @@ class CleanupTest(unittest.TestCase):
                 self.assertEqual(result['cleanup']['state'],'failed',result)
                 self.assertIn('first.MP4',self.camera.files)
                 self.assertEqual(result['cleanup']['files'],0)
+                self.assertEqual(result['cleanup']['verified_files'],0)
                 self.camera.files['first.MP4']=b'first'
 
     def test_failed_copy_cannot_delete(self):
@@ -105,6 +107,7 @@ class CleanupTest(unittest.TestCase):
         self.assertEqual(result['cleanup']['state'],'cancelled');self.assertEqual(len(self.camera.files),1)
         result=self.delete(result)
         self.assertEqual(result['cleanup']['state'],'complete');self.assertEqual(self.camera.files,{})
+        self.assertEqual(result['cleanup']['previous_deleted_files'],1)
         self.assertEqual(len((self.hw.dst/job['destination']/'deleted.jsonl').read_text().splitlines()),2)
 
     def test_legacy_layout_deletion_and_restart_do_not_auto_delete(self):
@@ -147,6 +150,58 @@ class CleanupTest(unittest.TestCase):
         self.assertEqual(self.engine.devices(),[])
         self.hw.devices.assert_not_called();self.assertFalse(self.engine.discovering)
         active['state']='complete';self.engine.active_job=None
+
+    def test_live_verification_and_deletion_counts_are_separate_and_snapshot_is_stable(self):
+        job=self.copy(paths=['first.MP4'])
+        reading,verified=threading.Event(),threading.Event()
+        continue_read,continue_delete=threading.Event(),threading.Event()
+        def gated(path,record,verify_backup,check,progress):
+            progress(2);reading.set()
+            if not continue_read.wait(5):raise RuntimeError('Read gate timed out')
+            progress(record['size']-2);verify_backup();verified.set()
+            if not continue_delete.wait(5):raise RuntimeError('Delete gate timed out')
+            check();del self.camera.files[path]
+        try:
+            with patch.object(self.camera,'delete_verified',side_effect=gated):
+                token=self.engine.prepare_delete(job['id'])
+                self.engine.delete_verified(token['token'],token['confirmation'])
+                self.assertTrue(reading.wait(3))
+                first=self.engine.snapshot()[0]['cleanup']
+                self.assertEqual(first['phase_bytes'],2);self.assertEqual(first['total_bytes'],10)
+                self.assertEqual(first['files'],0);self.assertEqual(first['verified_files'],0)
+                continue_read.set();self.assertTrue(verified.wait(3))
+                middle=self.engine.snapshot()[0]['cleanup']
+                self.assertEqual(middle['phase_bytes'],10);self.assertEqual(middle['verified_files'],1)
+                self.assertEqual(middle['files'],0);self.assertIn('first.MP4',self.camera.files)
+                self.assertEqual(first['phase_bytes'],2,'Earlier snapshot mutated with worker progress')
+                continue_delete.set();result=self.wait()
+                self.assertEqual(result['cleanup']['files'],1)
+                self.assertEqual(result['cleanup']['verified_files'],1)
+                self.assertEqual(result['cleanup']['state'],'complete')
+                self.engine=Transfers(self.hw,self.root/'history.json')
+                self.assertEqual(self.engine.snapshot()[0]['cleanup'],result['cleanup'])
+        finally:
+            continue_read.set();continue_delete.set();self.wait()
+
+    def test_zero_byte_file_still_requires_verification_before_deletion_count(self):
+        self.camera.files['empty.bin']=b''
+        job=self.copy(paths=['empty.bin']);result=self.delete(job)
+        self.assertEqual(result['cleanup']['total_bytes'],0)
+        self.assertEqual(result['cleanup']['verified_files'],1)
+        self.assertEqual(result['cleanup']['files'],1)
+
+    def test_disk_ready_callback_reports_verification_before_delete_authorization(self):
+        import subprocess
+        real_popen=subprocess.Popen;marker=self.root/'delete-authorized'
+        script='import json,sys; from pathlib import Path; json.loads(sys.stdin.buffer.readline()); print(json.dumps({"bytes":8}),flush=True); print(json.dumps({"ready":True}),flush=True); assert json.loads(sys.stdin.buffer.readline())=={"delete":True}; Path(sys.argv[1]).touch(); print(json.dumps({"deleted":True}),flush=True)'
+        events=[]
+        def ready():
+            self.assertFalse(marker.exists());events.append('verified')
+        hw=Hardware({})
+        with patch('core.subprocess.Popen',side_effect=lambda *a,**kw:real_popen([sys.executable,'-u','-c',script,str(marker)],**kw)):
+            hw.delete_verified('8:1:0123456789abcdef',dict(path='clip',backup_path='saved',size=4,sha256='a'*64),
+                               lambda:None,lambda n:events.append(n),verified=ready)
+        self.assertEqual(events,[8,'verified']);self.assertTrue(marker.exists())
 
 
 class CameraDeleteProtocolTest(unittest.TestCase):

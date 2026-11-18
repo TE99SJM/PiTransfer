@@ -178,14 +178,14 @@ def main():
                         queued_card = page.locator(f'[data-job-id="{waiting["id"]}"]')
                         running_card = page.locator(f'[data-job-id="{active["id"]}"]')
                         expect(queued_card).to_contain_text('queue position 1')
-                        expect(queued_card.locator('progress')).to_have_attribute('value','0')
-                        expect(running_card.locator('progress')).to_have_count(1)
+                        expect(queued_card.locator('.copy-progress')).to_have_attribute('value','0')
+                        expect(running_card.locator('.copy-progress')).to_have_count(1)
                         expect(queued_card.get_by_role('button',name='Remove from queue')).to_be_enabled()
                         gate.set()
                         expect(queued_card.locator('.pill')).to_have_text('complete',timeout=15000)
                         expect(running_card.locator('.pill')).to_have_text('complete',timeout=15000)
-                        expect(queued_card.locator('progress')).to_have_attribute('value','100')
-                        expect(page.locator('#jobs progress')).to_have_count(len(application.transfers.snapshot()))
+                        expect(queued_card.locator('.copy-progress')).to_have_attribute('value','100')
+                        expect(page.locator('#jobs .copy-progress')).to_have_count(len(application.transfers.snapshot()))
                     finally:
                         gate.set()
                         camera.stream = original_stream
@@ -194,10 +194,14 @@ def main():
                     copied_card=page.locator(f'[data-job-id="{job["id"]}"]')
                     delete=copied_card.get_by_role('button',name='Delete verified originals')
                     expect(delete).to_be_enabled()
+                    expect(copied_card.locator('.verification-progress')).to_have_attribute('value','0')
+                    expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
+                    expect(copied_card.locator('.cleanup-status')).to_contain_text('Not started')
                     page.once('dialog',lambda dialog:dialog.dismiss())
                     delete.click()
                     expect(delete).to_be_enabled()
                     assert 'DCIM/100GOPRO/photo.RAW' in camera.files
+                    expect(copied_card.locator('.cleanup-status')).to_contain_text('Confirmation was cancelled')
                     page.once('dialog',lambda dialog:dialog.accept('wrong'))
                     delete.click()
                     expect(page.locator('#notice')).to_contain_text('Nothing was deleted')
@@ -206,14 +210,66 @@ def main():
                         assert '2 verified originals' in dialog.message
                         assert 'NAS copies are kept' in dialog.message
                         dialog.accept('DELETE 2')
-                    page.once('dialog',confirm_delete)
-                    delete.click()
-                    expect(copied_card).to_contain_text('Original deletion: complete',timeout=15000)
+                    # Hold verification and deletion separately to inspect live bars.
+                    started,checked=threading.Event(),threading.Event()
+                    finish_check,finish_delete=threading.Event(),threading.Event()
+                    original_delete=camera.delete_verified
+                    def gated_delete(path,record,verify_backup,check,progress):
+                        data=camera.files[path]
+                        if path.endswith('clip.MP4'):
+                            half=len(data)//2;progress(half);started.set()
+                            if not finish_check.wait(30):raise RuntimeError('Verification gate timed out')
+                            progress(len(data)-half);verify_backup();checked.set()
+                            if not finish_delete.wait(30):raise RuntimeError('Deletion gate timed out')
+                            check();del camera.files[path]
+                        else: original_delete(path,record,verify_backup,check,progress)
+                    camera.delete_verified=gated_delete
+                    try:
+                        page.once('dialog',confirm_delete)
+                        delete.click();assert started.wait(5)
+                        expect(copied_card.locator('.cleanup-status')).to_contain_text('Verifying originals')
+                        expect(copied_card.locator('.copy-progress')).to_have_attribute('value','100')
+                        expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
+                        expect(copied_card.locator('.verification-progress')).to_have_js_property('value',len(camera.files['DCIM/100GOPRO/clip.MP4'])//2/(2*(len(camera.files['DCIM/100GOPRO/clip.MP4'])+3))*100)
+                        expect(copied_card.get_by_role('button',name='Stop deleting')).to_be_enabled()
+                        assert len(camera.files)==3
+                        finish_check.set();assert checked.wait(5)
+                        expect(copied_card.locator('.cleanup-status')).to_contain_text('Deleting the verified file')
+                        expect(copied_card.locator('.cleanup-section')).to_contain_text('1 of 2 files verified')
+                        expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
+                        finish_delete.set()
+                        expect(copied_card).to_contain_text('Original deletion: complete',timeout=15000)
+                    finally:
+                        finish_check.set();finish_delete.set();camera.delete_verified=original_delete
                     assert 'DCIM/100GOPRO/photo.RAW' not in camera.files
                     assert 'DCIM/100GOPRO/clip.MP4' not in camera.files
                     assert 'note.txt' in camera.files
                     assert (hardware.dst/job['output_folders'][0]/'photo.RAW').read_bytes()==b'raw'
                     expect(delete).to_have_count(0)
+                    expect(copied_card.locator('.verification-progress')).to_have_attribute('value','100')
+                    expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','100')
+                    expect(copied_card.locator('.cleanup-status')).to_contain_text('Originals deleted')
+                    expect(page.locator('#files')).not_to_contain_text('DCIM')
+
+                    # Completion bars persist after a page reload; failed verification
+                    # stays below 100 even when the final checksum consumed every byte.
+                    page.reload()
+                    expect(copied_card.locator('.verification-progress')).to_have_attribute('value','100')
+                    expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','100')
+                    assert page.evaluate("cleanupProgress({state:'failed',total_files:1,files:0,verified_files:0,total_bytes:10,phase_bytes:10}).verification.percent")==99.9
+                    assert page.evaluate("cleanupProgress({state:'deleting',total_files:1,files:0,verified_files:1,total_bytes:0,phase_bytes:0}).verification.percent")==100
+                    assert page.evaluate("cleanupProgress({state:'interrupted',total_files:2,files:1,total_bytes:20,phase_bytes:10}).deletion.percent")==50
+                    assert page.evaluate("cleanupProgress({state:'complete',total_files:1,files:1}).verification.percent")==100
+
+                    # A deletion failure must be visible separately from the completed copy.
+                    camera.files['note.txt']=b'changed original'
+                    page.once('dialog',lambda dialog:dialog.accept('DELETE 1'))
+                    legacy_card.get_by_role('button',name='Delete verified originals').click()
+                    expect(legacy_card.locator('.cleanup-status')).to_contain_text('Deletion stopped with an error')
+                    expect(legacy_card.locator('.cleanup-error')).to_contain_text('Original checksum changed')
+                    expect(legacy_card.locator('.deletion-progress')).to_have_attribute('value','0')
+                    expect(legacy_card.locator('.copy-progress')).to_have_attribute('value','100')
+                    assert camera.files['note.txt']==b'changed original'
 
                     page.set_viewport_size({"width":390,"height":844})
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'

@@ -56,11 +56,13 @@ One worker serializes copying, organizing, source browsing and deletion. Camera 
 
 ## Verified original deletion
 
-A completed transfer exposes **Delete verified originals**. Reconnect/select the original camera or USB drive if needed. The confirmation shows the source, file count and byte total and requires typing `DELETE N`. Only files in that completed transfer's verified manifest are eligible. No deletion starts automatically after copying, closing the window, or restarting the Pi.
+A completed transfer shows its **Copy complete** bar and a separate **Verify and delete originals** section. The **Verification** bar tracks bytes read from both originals and NAS copies plus the number of matching file pairs. The **Deletion** bar counts originals whose deletion was acknowledged and recorded. Both remain visible after completion or a stopped/failed operation, with the current filename and any error. They update once a second and show “Not started” until you explicitly begin. Confirmed completion reaches 100%; reading all bytes without a matching checksum does not count as successful verification.
+
+The section exposes **Delete verified originals**. Reconnect/select the original camera or USB drive if needed. The confirmation shows the source, file count and byte total and requires typing `DELETE N`. Only files in that completed transfer's verified manifest are eligible. No deletion starts automatically after copying, closing the window, or restarting the Pi.
 
 For each file the app freshly checks SHA-256 and size of both the original and NAS backup before issuing a single-file delete. Changed, missing, unsupported, linked or unreadable files stop the operation; unselected files, skipped items, directories and NAS backups are never deleted. Camera verification and deletion share one open camera session. Disk sources are verified while read-only; the root helper also independently validates the encrypted NAS mount, briefly remounts only the managed source writable for the exact unlink, and restores read-only protection. Filesystems/cards that reject a safe writable remount (including some journal-disabled or NTFS mounts) cannot be deleted through this action. If read-only restoration fails, the helper attempts to unmount the source and reports the failure.
 
-Deletion runs on the Pi after confirmation, even when the browser closes. **Stop deleting** stops before a later file; a file already authorized may finish deleting. Successful deletes are recorded durably in `deleted.jsonl` and excluded from a later explicitly confirmed retry. A disconnect/power loss after unlink but before the receipt is saved can leave an uncertain result; a missing original is reported, never silently counted as deleted. Restarting never resumes deletion. Keep the device idle and avoid modifying the NAS copies during verification/deletion; hashing cannot lock a camera's firmware or another NAS client's writes indefinitely.
+Cancelled/incorrect confirmations and startup errors appear directly inside the transfer card. Once deletion starts, the old source listing is cleared so stale filenames cannot be mistaken for undeleted files; select the device again when idle to get a fresh listing. Deletion runs on the Pi after confirmation, even when the browser closes. **Stop deleting** stops before a later file; a file already authorized may finish deleting. Successful deletes are recorded durably in `deleted.jsonl` and excluded from a later explicitly confirmed retry. A disconnect/power loss after unlink but before the receipt is saved can leave an uncertain result; a missing original is reported, never silently counted as deleted. Restarting never resumes deletion. Keep the device idle and avoid modifying the NAS copies during verification/deletion; hashing cannot lock a camera's firmware or another NAS client's writes indefinitely.
 
 ## Multiple devices and progress bars
 
@@ -156,4 +158,4 @@ Additional tests cover flat date grouping, real MP4 timestamps, timezone boundar
 - [python-gphoto2 bindings and file APIs](https://github.com/jim-easterbrook/python-gphoto2)
 - [GoPro USB connection troubleshooting](https://community.gopro.com/s/article/Camera-is-not-Recognized-when-Plugged-into-a-Computer-USB-Port?language=en_US)
 
-Version: 0.6.0
+Version: 0.6.1

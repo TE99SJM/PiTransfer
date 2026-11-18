@@ -80,7 +80,7 @@ def prepare(engine, job_id, device=None):
         with engine.lock:
             engine.delete_tokens={k:v for k,v in engine.delete_tokens.items() if v['expires']>time.monotonic()}
             if len(engine.delete_tokens)>=32: engine.delete_tokens.pop(next(iter(engine.delete_tokens)))
-            engine.delete_tokens[token]=dict(job_id=job_id,device=source,signature=signature,count=count,
+            engine.delete_tokens[token]=dict(job_id=job_id,device=source,signature=signature,count=count,bytes=size,
                                               expires=time.monotonic()+300)
         label=next((d['label'] for d in engine.device_cache if d['id']==source),job.get('device_label','original device'))
         return dict(token=token,id=job_id,files=count,bytes=size,source=label,confirmation=f'DELETE {count}')
@@ -100,7 +100,8 @@ def start(engine, token, confirmation):
             engine.cancel_event.clear()
             job['cleanup_previous_state']=job['state']
             job.update(state='deleting',cleanup={'state':'checking','device':request['device'],'files':0,'total_files':request['count'],
-                                                'bytes':0,'phase_bytes':0,'error':'','current':''})
+                                                'bytes':0,'phase_bytes':0,'total_bytes':2*request['bytes'],'verified_files':0,
+                                                'previous_deleted_files':0,'error':'','current':''})
             engine.active_job=job
             engine.save()
         threading.Thread(target=run,args=(engine,job,request),daemon=True).start()
@@ -131,15 +132,23 @@ def run(engine,job,request):
                 info=os.fstat(audit.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1:
                     raise ValueError('Invalid deletion audit')
-                cleanup['total_bytes']=2*sum(e['size'] for e in entries)
+                with engine.lock:
+                    cleanup.update(total_bytes=2*sum(e['size'] for e in entries),previous_deleted_files=len(deleted))
                 source=engine.hardware.camera_source(request['device']) if request['device'].startswith('camera:') else None
                 for entry in entries:
                     engine.check()
-                    cleanup.update(current=entry['path'],state='verifying')
-                    engine.checkpoint(job)
+                    with engine.lock:
+                        cleanup.update(current=entry['path'],state='verifying')
+                        engine.checkpoint(job)
                     names=parts(entry['backup_path'])
                     # Keep the backup parent pinned throughout source verification/deletion.
                     with directory(nas,'/'.join(names[:-1])) as parent:
+                        def verified():
+                            # Count only a matching original AND NAS copy. Reading
+                            # all bytes alone does not mean verification passed.
+                            with engine.lock:
+                                cleanup.update(verified_files=cleanup['verified_files']+1,state='deleting')
+                                engine.checkpoint(job)
                         def verify_backup():
                             before=os.stat(names[-1],dir_fd=parent,follow_symlinks=False)
                             if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:
@@ -150,23 +159,24 @@ def run(engine,job,request):
                             if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):
                                 raise RuntimeError('NAS copy changed during verification; original was kept')
                             engine.check()
-                            cleanup['state']='deleting'
+                            verified()
                         if source:
                             source.delete_verified(entry['path'],entry,verify_backup,engine.check,progress)
                         else:
                             # The root helper validates and hashes both files itself,
                             # then briefly remounts only this managed source for unlink.
-                            engine.hardware.delete_verified(request['device'],entry,engine.check,progress)
+                            engine.hardware.delete_verified(request['device'],entry,engine.check,progress,verified=verified)
                     record={k:entry[k] for k in ('path','size','sha256')}
                     record.update(status='deleted',at=time.time(),device=request['device'])
                     engine.write_record(audit,record)
-                    cleanup.update(files=cleanup['files']+1,bytes=cleanup['bytes']+entry['size'])
-                    engine.checkpoint(job)
-        cleanup.update(state='complete',current='')
+                    with engine.lock:
+                        cleanup.update(files=cleanup['files']+1,bytes=cleanup['bytes']+entry['size'])
+                        engine.checkpoint(job)
+        with engine.lock: cleanup.update(state='complete',current='')
     except Cancelled:
-        cleanup.update(state='cancelled',error='Deletion stopped. Files already deleted are recorded; remaining originals were kept.')
+        with engine.lock: cleanup.update(state='cancelled',error='Deletion stopped. Files already deleted are recorded; remaining originals were kept.')
     except Exception as exc:
-        cleanup.update(state='failed',error=str(exc)[:800])
+        with engine.lock: cleanup.update(state='failed',error=str(exc)[:800])
     finally:
         try:
             with engine.lock:

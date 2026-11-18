@@ -1,6 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let csrf = '', device = null, currentPath = '', offset = 0, nasReady = false, busy = false, polling = false;
+const cleanupFeedback = new Map();
 let selected = new Set(), devices = [], jobsState = [], jobsPolling = false;
 let sizing = false, serverSizing = false, preparing = false, sizeResult = null, sizeKey = '', sizeJobId = null, nasFree = null;
 let nasShare = '', nasFolder = '', nasBrowsePath = '', nasOffset = 0, nasLoading = false;
@@ -157,14 +158,10 @@ async function browse() {
   });controls();
 }
 function jobProgress(j) {
-  if(j.state==='deleting') {
-    const c=j.cleanup||{},total=c.total_bytes||0;
-    return {percent:total?Math.min(99.9,(c.phase_bytes||0)/total*100):null,title:'Rechecking and deleting originals',detail:`${c.files||0} of ${c.total_files||0} originals deleted · ${bytes(c.phase_bytes||0)} checked`};
-  }
   if(j.state==='organizing') return {percent:j.phase_total?Math.min(99.9,(j.phase_bytes||0)/j.phase_total*100):null,title:'Organizing by camera and date',detail:`${j.published_files||0} of ${j.files} files placed in date folders`};
-  const done=['complete','complete_with_skips'].includes(j.state), stopped=['failed','cancelled','interrupted'].includes(j.state);
+  const done=['complete','complete_with_skips','deleting'].includes(j.state), stopped=['failed','cancelled','interrupted'].includes(j.state);
   const clamp=n=>Math.max(0,Math.min(done?100:99.9,n));
-  if(done) return {percent:100,title:'Complete',detail:`${bytes(j.bytes)} · ${j.files} files verified`};
+  if(done) return {percent:100,title:'Copy complete',detail:`${bytes(j.bytes)} · ${j.files} files verified`};
   if(j.state==='queued') return {percent:0,title:`Waiting${j.queue_position?' · queue position '+j.queue_position:''}`,detail:'Starts automatically after earlier transfers. Keep this device connected.'};
   let percent=null,title='Preparing transfer',detail='';
   if(j.state==='counting') {title='Counting files';detail=`${j.total_files||0} files · ${bytes(j.total_bytes||0)} found so far`;}
@@ -183,7 +180,60 @@ function jobProgress(j) {
   if(stopped) title=j.state==='failed'?'Needs attention':j.state==='cancelled'?'Cancelled':'Interrupted';
   return {percent,title,detail,stopped};
 }
+function appendProgress(parent, label, state, kind) {
+  const summary=node('div',undefined,'progress-heading');
+  summary.append(node('strong',state.title),node('span',state.percent===null?'':`${state.percent===100?'100':state.percent.toFixed(1)}%`));
+  const bar=node('progress',undefined,'transfer-progress '+kind);bar.max=100;
+  if(state.percent!==null || state.stopped) bar.value=state.percent??0;
+  bar.setAttribute('aria-label',`${label}: ${state.title}`);
+  bar.setAttribute('aria-valuetext',state.detail || state.title);
+  parent.append(summary,bar,node('p',state.detail,'progress-detail'));
+}
+function cleanupProgress(c) {
+  const totalFiles=c.total_files||0, deleted=c.files||0;
+  const passed=c.verified_files??deleted, read=c.phase_bytes||0, total=c.total_bytes||0;
+  const complete=c.state==='complete', stopped=['failed','cancelled','interrupted'].includes(c.state);
+  const verified=complete || (totalFiles>0 && passed>=totalFiles);
+  let verification=verified?100:total>0?Math.max(0,Math.min(99.9,read/total*100)):
+    totalFiles>0?Math.max(0,Math.min(99.9,passed/totalFiles*100)):null;
+  if(c.state==='idle') verification=0;
+  const deletion=complete?100:totalFiles>0?Math.max(0,Math.min(99.9,deleted/totalFiles*100)):0;
+  return {
+    verification:{percent:verification,title:'Verification',stopped,
+      detail:`${bytes(read)} of ${bytes(total)} checked (originals + NAS) · ${complete?totalFiles:passed} of ${totalFiles} files verified`},
+    deletion:{percent:deletion,title:'Deletion',stopped,
+      detail:`${deleted} of ${totalFiles} originals deleted · ${bytes(c.bytes||0)} removed · NAS copies kept`}
+  };
+}
+function renderCleanup(row,j,label) {
+  const feedback=cleanupFeedback.get(j.id);
+  if(!j.cleanup && !j.can_delete && !feedback) return;
+  const c=j.cleanup||{state:'idle',files:0,verified_files:0,total_files:j.files,total_bytes:2*j.bytes,phase_bytes:0};
+  const panel=node('section',undefined,'cleanup-section '+c.state);
+  panel.setAttribute('aria-label',`${label}: verification and deletion`);
+  panel.append(node('h3','Verify and delete originals'));
+  const statuses={idle:'Not started — originals have not been deleted by this transfer.',checking:'Preparing verification…',
+    verifying:'Verifying originals and NAS copies…',deleting:'Deleting the verified file…',
+    complete:'Originals deleted. Verified NAS copies are kept.',failed:'Deletion stopped with an error.',
+    cancelled:'Deletion cancelled.',interrupted:'Deletion interrupted. It will not restart automatically.'};
+  const status=node('p',feedback?.message || statuses[c.state] || c.state,'cleanup-status');
+  status.setAttribute('role','status');panel.append(status);
+  const progress=cleanupProgress(c);
+  if(feedback?.pending) progress.verification={percent:null,title:'Verification',detail:feedback.message};
+  appendProgress(panel,label,progress.verification,'verification-progress');
+  appendProgress(panel,label,progress.deletion,'deletion-progress');
+  if(j.cleanup) panel.append(node('p',`Original deletion: ${c.state} · ${c.files||0} of ${c.total_files||0} deleted in this operation`,'cleanup-detail'));
+  if(c.previous_deleted_files) panel.append(node('p',`${c.previous_deleted_files} originals deleted in earlier attempts.`));
+  if(c.current) panel.append(node('p',c.current,'path cleanup-current'));
+  if(c.error) {const error=node('p',c.error,'cleanup-error');error.setAttribute('role','alert');panel.append(error);}
+  if(j.state==='deleting') panel.append(button('Stop deleting',async()=>{
+    await api('cancel',{id:j.id});notice('Stopping deletion after any file already authorized.');await refresh();
+  },'danger'));
+  if(j.can_delete) panel.append(button('Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
+  row.append(panel);
+}
 function renderJobs(jobs) {
+  for(const j of jobs) if(j.state==='deleting' || j.cleanup?.state==='complete') cleanupFeedback.delete(j.id);
   jobsState=jobs;
   busy=jobs.some(j=>activeStates.has(j.state));$('jobs').replaceChildren();
   if(!jobs.length) $('jobs').append(node('p','Your transfers will appear here.','empty'));
@@ -192,20 +242,14 @@ function renderJobs(jobs) {
     const date=new Date(j.created).toLocaleString(), label=j.device_label || devices.find(d=>d.id===j.device)?.label || (j.device?.startsWith('camera:')?'USB camera':'USB drive');
     top.append(node('strong',label),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
     row.append(node('p',`${date} · ${j.device_node || j.device}`,'path'));
-    const state=jobProgress(j), summary=node('div',undefined,'progress-heading');
-    summary.append(node('strong',state.title),node('span',state.percent===null?'':`${state.percent===100?'100':state.percent.toFixed(1)}%`));
-    row.append(summary);
-    const progress=node('progress',undefined,'transfer-progress');progress.max=100;
-    if(state.percent!==null || state.stopped) progress.value=state.percent??0;
-    progress.setAttribute('aria-label',`${label}: ${state.title}`);
-    progress.setAttribute('aria-valuetext',state.detail || state.title);row.append(progress,node('p',state.detail,'progress-detail'));
+    appendProgress(row,label,jobProgress(j),'copy-progress');
     row.append(node('p',`${j.files} files verified · ${bytes(j.bytes)} copied${j.skipped ? ' · '+j.skipped+' skipped':''}`));
     if(j.reused_files) row.append(node('p',`${j.reused_files} saved files rechecked · ${bytes(j.reused_bytes)} reused`));
     if(Number.isFinite(j.total_bytes)) {
       row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
     }
     if(j.current)row.append(node('p',j.current,'path'));if(j.output_folders?.length) { for(const folder of j.output_folders) row.append(node('p',folder,'path')); } else if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
-    if(activeStates.has(j.state))row.append(button(j.state==='queued'?'Remove from queue':j.state==='deleting'?'Stop deleting':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
+    if(activeStates.has(j.state) && j.state!=='deleting')row.append(button(j.state==='queued'?'Remove from queue':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
     if(j.can_resume) {
       row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
       row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
@@ -213,13 +257,7 @@ function renderJobs(jobs) {
       row.append(node('p','This older transfer has no saved selection for resuming. Its NAS files are retained.'));
     }
     if(j.can_organize) row.append(button('Organize by date',()=>organizeTransfer(j),'secondary organize-transfer'));
-    if(j.can_delete) row.append(button('Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
-    if(j.cleanup) {
-      const c=j.cleanup;
-      row.append(node('p',`Original deletion: ${c.state} · ${c.files||0} of ${c.total_files||0} deleted in this operation`,'cleanup-detail'));
-      if(c.current && j.state==='deleting') row.append(node('p',c.current,'path'));
-      if(c.error) row.append(node('p',c.error,'cleanup-error'));
-    }
+    renderCleanup(row,j,label);
     $('jobs').append(row);
   }controls();
 }
@@ -255,15 +293,28 @@ async function organizeTransfer(job) {
 }
 async function deleteOriginals(job) {
   preparing=true;controls();
+  function feedback(message,pending=false) {
+    cleanupFeedback.set(job.id,{message,pending});renderJobs(jobsState);
+  }
   try {
+    feedback('Preparing deletion confirmation…',true);
     const source=device || job.device;
     if(!devices.some(d=>d.id===source && d.usable)) throw new Error('Reconnect and select the original camera or drive, then try again.');
     const prepared=await api('delete/prepare',{id:job.id,device:source});
+    feedback('Awaiting confirmation. Nothing is being deleted.');
     const answer=prompt(`Permanently delete ${prepared.files} verified originals (${bytes(prepared.bytes)}) from ${prepared.source}?\nThe Pi rechecks each original and its NAS copy before deletion. Changed or missing files stop the operation. NAS copies are kept.\nType ${prepared.confirmation} to confirm.`);
-    if(answer===null) return;
+    if(answer===null) {feedback('Deletion not started. Confirmation was cancelled.');return;}
     if(answer!==prepared.confirmation) throw new Error('Confirmation did not match. Nothing was deleted.');
-    await api('delete/confirm',{token:prepared.token,confirmation:answer});
-    notice('Verification and original deletion started on the Pi. Stop deleting prevents later files from being deleted.');await refresh();
+    feedback('Starting verification and deletion…',true);
+    const result=await api('delete/confirm',{token:prepared.token,confirmation:answer});
+    cleanupFeedback.delete(job.id);
+    renderJobs(jobsState.map(j=>j.id===job.id?{...j,...result,can_delete:false}:j));
+    // Clear names which can now become stale. A new selection lists the device afresh.
+    if(device===source) resetBrowser();
+    $('jobs').querySelector(`[data-job-id="${job.id}"] .cleanup-section`)?.scrollIntoView({block:'nearest'});
+    notice('Verification and deletion started. Follow the two progress bars in this transfer.');await refresh();
+  } catch(error) {
+    feedback(error.message);throw error;
   } finally {preparing=false;controls();}
 }
 async function refresh() {
