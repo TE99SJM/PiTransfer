@@ -157,10 +157,10 @@ def run(engine,job,request):
                             if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:
                                 raise ValueError('NAS backup is no longer a regular, unique file')
                             if engine.hash_file(parent,names[-1],progress)!=(entry['size'],entry['sha256']):
-                                raise RuntimeError('NAS copy no longer matches; original was kept: '+entry['path'])
+                                raise RuntimeError('NAS copy no longer matches the saved checksum; deletion stopped: '+entry['path'])
                             after=os.stat(names[-1],dir_fd=parent,follow_symlinks=False)
                             if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):
-                                raise RuntimeError('NAS copy changed during verification; original was kept')
+                                raise RuntimeError('NAS copy changed during verification; deletion stopped')
                             engine.check()
                             if original_present:
                                 verified()

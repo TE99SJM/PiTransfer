@@ -145,6 +145,7 @@ class CleanupTest(unittest.TestCase):
             result=self.delete(job);c=result['cleanup']
             self.assertEqual(c['state'],'failed',result)
             self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(0,0,0))
+            self.assertNotIn('original was kept',c['error'])
             self.assertIn('second.MP4',self.camera.files)
 
     def test_camera_errors_and_generic_missing_exceptions_are_not_treated_as_absence(self):
