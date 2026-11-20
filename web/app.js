@@ -191,18 +191,19 @@ function appendProgress(parent, label, state, kind) {
 }
 function cleanupProgress(c) {
   const totalFiles=c.total_files||0, deleted=c.files||0;
+  const missing=c.missing_files||0, available=Math.max(0,totalFiles-missing);
   const passed=c.verified_files??deleted, read=c.phase_bytes||0, total=c.total_bytes||0;
-  const complete=c.state==='complete', stopped=['failed','cancelled','interrupted'].includes(c.state);
-  const verified=complete || (totalFiles>0 && passed>=totalFiles);
+  const complete=['complete','complete_with_missing'].includes(c.state), stopped=['failed','cancelled','interrupted'].includes(c.state);
+  const verified=complete || (totalFiles>0 && passed+missing>=totalFiles);
   let verification=verified?100:total>0?Math.max(0,Math.min(99.9,read/total*100)):
-    totalFiles>0?Math.max(0,Math.min(99.9,passed/totalFiles*100)):null;
+    totalFiles>0?Math.max(0,Math.min(99.9,(passed+missing)/totalFiles*100)):null;
   if(c.state==='idle') verification=0;
-  const deletion=complete?100:totalFiles>0?Math.max(0,Math.min(99.9,deleted/totalFiles*100)):0;
+  const deletion=available>0?(complete?100:Math.max(0,Math.min(99.9,deleted/available*100))):0;
   return {
     verification:{percent:verification,title:'Verification',stopped,
-      detail:`${bytes(read)} of ${bytes(total)} checked (originals + NAS) · ${complete?totalFiles:passed} of ${totalFiles} files verified`},
-    deletion:{percent:deletion,title:'Deletion',stopped,
-      detail:`${deleted} of ${totalFiles} originals deleted · ${bytes(c.bytes||0)} removed · NAS copies kept`}
+      detail:`${bytes(read)} of ${bytes(total)} checked (originals + NAS) · ${complete?available:passed} of ${available} ${missing?'available ':''}files verified${missing?` · ${missing} already absent; NAS backups verified`:''}`},
+    deletion:{percent:deletion,title:complete&&missing&&available===0?'Deletion · no originals present':'Deletion',stopped,
+      detail:`${deleted} of ${available} ${missing?'available ':''}originals deleted · ${bytes(c.bytes||0)} removed${missing?` · ${missing} already absent (not counted as deleted)`:''} · NAS copies kept`}
   };
 }
 function renderCleanup(row,j,label) {
@@ -214,7 +215,9 @@ function renderCleanup(row,j,label) {
   panel.append(node('h3','Verify and delete originals'));
   const statuses={idle:'Not started — originals have not been deleted by this transfer.',checking:'Preparing verification…',
     verifying:'Verifying originals and NAS copies…',deleting:'Deleting the verified file…',
-    complete:'Originals deleted. Verified NAS copies are kept.',failed:'Deletion stopped with an error.',
+    complete:'Originals deleted. Verified NAS copies are kept.',
+    complete_with_missing:`Finished: ${c.files||0} originals deleted; ${c.missing_files||0} already absent. NAS backups verified.`,
+    failed:'Deletion stopped with an error.',
     cancelled:'Deletion cancelled.',interrupted:'Deletion interrupted. It will not restart automatically.'};
   const status=node('p',feedback?.message || statuses[c.state] || c.state,'cleanup-status');
   status.setAttribute('role','status');panel.append(status);
@@ -222,18 +225,27 @@ function renderCleanup(row,j,label) {
   if(feedback?.pending) progress.verification={percent:null,title:'Verification',detail:feedback.message};
   appendProgress(panel,label,progress.verification,'verification-progress');
   appendProgress(panel,label,progress.deletion,'deletion-progress');
-  if(j.cleanup) panel.append(node('p',`Original deletion: ${c.state} · ${c.files||0} of ${c.total_files||0} deleted in this operation`,'cleanup-detail'));
+  if(j.cleanup) panel.append(node('p',`Original deletion: ${c.state.replaceAll('_',' ')} · ${c.files||0} of ${c.total_files||0} deleted in this operation`,'cleanup-detail'));
   if(c.previous_deleted_files) panel.append(node('p',`${c.previous_deleted_files} originals deleted in earlier attempts.`));
+  if(c.missing_files) {
+    const missing=node('details',undefined,'cleanup-missing');
+    missing.append(node('summary',`${c.missing_files} already absent from camera — not counted as deleted`));
+    missing.append(node('p','Their NAS backups match the saved checksums. The app cannot determine when or how the originals disappeared.'));
+    for(const path of c.missing_paths||[]) missing.append(node('p',path,'path'));
+    if(c.missing_files>(c.missing_paths||[]).length) missing.append(node('p','Showing the first 50 filenames.'));
+    panel.append(missing);
+  }
   if(c.current) panel.append(node('p',c.current,'path cleanup-current'));
   if(c.error) {const error=node('p',c.error,'cleanup-error');error.setAttribute('role','alert');panel.append(error);}
   if(j.state==='deleting') panel.append(button('Stop deleting',async()=>{
     await api('cancel',{id:j.id});notice('Stopping deletion after any file already authorized.');await refresh();
   },'danger'));
-  if(j.can_delete) panel.append(button('Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
+  if(j.can_delete) panel.append(button(c.state==='complete_with_missing'?'Recheck remaining originals':'Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
   row.append(panel);
 }
 function renderJobs(jobs) {
   for(const j of jobs) if(j.state==='deleting' || j.cleanup?.state==='complete') cleanupFeedback.delete(j.id);
+  const expandedMissing=new Set([...$('jobs').querySelectorAll('.cleanup-missing[open]')].map(panel=>panel.closest('.job').dataset.jobId));
   jobsState=jobs;
   busy=jobs.some(j=>activeStates.has(j.state));$('jobs').replaceChildren();
   if(!jobs.length) $('jobs').append(node('p','Your transfers will appear here.','empty'));
@@ -258,6 +270,7 @@ function renderJobs(jobs) {
     }
     if(j.can_organize) row.append(button('Organize by date',()=>organizeTransfer(j),'secondary organize-transfer'));
     renderCleanup(row,j,label);
+    if(expandedMissing.has(j.id)) row.querySelector('.cleanup-missing')?.setAttribute('open','');
     $('jobs').append(row);
   }controls();
 }
@@ -302,7 +315,7 @@ async function deleteOriginals(job) {
     if(!devices.some(d=>d.id===source && d.usable)) throw new Error('Reconnect and select the original camera or drive, then try again.');
     const prepared=await api('delete/prepare',{id:job.id,device:source});
     feedback('Awaiting confirmation. Nothing is being deleted.');
-    const answer=prompt(`Permanently delete ${prepared.files} verified originals (${bytes(prepared.bytes)}) from ${prepared.source}?\nThe Pi rechecks each original and its NAS copy before deletion. Changed or missing files stop the operation. NAS copies are kept.\nType ${prepared.confirmation} to confirm.`);
+    const answer=prompt(`Permanently delete ${prepared.files} verified originals (${bytes(prepared.bytes)}) from ${prepared.source}?\nThe Pi rechecks each original and its NAS copy before deletion. Changed files, unreadable files or missing NAS backups stop the operation. Camera originals confirmed absent are reported separately after checking their backups. NAS copies are kept.\nType ${prepared.confirmation} to confirm.`);
     if(answer===null) {feedback('Deletion not started. Confirmation was cancelled.');return;}
     if(answer!==prepared.confirmation) throw new Error('Confirmation did not match. Nothing was deleted.');
     feedback('Starting verification and deletion…',true);

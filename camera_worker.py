@@ -12,6 +12,7 @@ import re
 import resource
 import sys
 import time
+import warnings
 
 USB_PORT = re.compile(r"usb:([0-9]{3}),([0-9]{3})\Z")
 CAMERA_ID = re.compile(r"camera:([0-9]{3}):([0-9]{3}):[0-9a-f]{16}\Z")
@@ -71,7 +72,11 @@ def detect_ports(gp, exclude=(), only=None):
         info = ports[index]
         path = info.get_path()
         if USB_PORT.fullmatch(path) and path not in exclude and (only is None or path == only):
-            selected.append(info)
+            # This binding's borrowed-pointer API is still needed on Trixie.
+            # Keep its deprecation notice out of user-facing USB errors.
+            with warnings.catch_warnings():
+                warnings.filterwarnings('ignore', message=r'.*GPPortInfoList::append.*deprecated.*', category=DeprecationWarning)
+                selected.append(info)
     abilities = gp.CameraAbilitiesList()
     abilities.load()
     return list(abilities.detect(selected)) if selected.count() else []
@@ -141,13 +146,15 @@ def file_info(gp, camera, path):
             "mtime": int(info.mtime) if info.fields & gp.GP_FILE_INFO_MTIME else None}
 
 
-def stat_path(gp, camera, path):
+def stat_path(gp, camera, path, missing_ok=False):
     names = components(path)
     if not names:
         return {"kind": "folder"}
     parent = "/".join(names[:-1])
     entry = next((e for e in entries(camera, parent) if e["name"] == names[-1]), None)
     if entry is None:
+        if missing_ok:
+            return {"kind": "missing"}
         raise FileNotFoundError("Camera item is no longer present: " + path)
     return {"kind": "folder"} if entry["kind"] == "folder" else file_info(gp, camera, path)
 
@@ -258,7 +265,9 @@ def main():
                 result = {"items": items[offset:offset + 200], "offset": offset,
                           "more": len(items) > offset + 200}
             elif action == "stat":
-                result = stat_path(gp, camera, path)
+                # Only a successful parent listing proves absence. Driver,
+                # disconnection and missing-folder errors still propagate.
+                result = stat_path(gp, camera, path, missing_ok=True)
             elif action == "estimate":
                 result = estimate(gp, camera, request["paths"],
                                   lambda totals: print(json.dumps(totals), flush=True))

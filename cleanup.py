@@ -8,6 +8,8 @@ import stat
 import threading
 import time
 
+from camera import CameraItemMissing
+
 COMPLETE = {'complete', 'complete_with_skips'}
 
 
@@ -101,6 +103,7 @@ def start(engine, token, confirmation):
             job['cleanup_previous_state']=job['state']
             job.update(state='deleting',cleanup={'state':'checking','device':request['device'],'files':0,'total_files':request['count'],
                                                 'bytes':0,'phase_bytes':0,'total_bytes':2*request['bytes'],'verified_files':0,
+                                                'missing_files':0,'missing_bytes':0,'missing_paths':[],
                                                 'previous_deleted_files':0,'error':'','current':''})
             engine.active_job=job
             engine.save()
@@ -149,7 +152,7 @@ def run(engine,job,request):
                             with engine.lock:
                                 cleanup.update(verified_files=cleanup['verified_files']+1,state='deleting')
                                 engine.checkpoint(job)
-                        def verify_backup():
+                        def verify_backup(original_present=True):
                             before=os.stat(names[-1],dir_fd=parent,follow_symlinks=False)
                             if not stat.S_ISREG(before.st_mode) or before.st_nlink!=1:
                                 raise ValueError('NAS backup is no longer a regular, unique file')
@@ -159,9 +162,27 @@ def run(engine,job,request):
                             if (before.st_dev,before.st_ino,before.st_size,before.st_mtime_ns,before.st_ctime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns):
                                 raise RuntimeError('NAS copy changed during verification; original was kept')
                             engine.check()
-                            verified()
+                            if original_present:
+                                verified()
                         if source:
-                            source.delete_verified(entry['path'],entry,verify_backup,engine.check,progress)
+                            try:
+                                source.delete_verified(entry['path'],entry,verify_backup,engine.check,progress)
+                            except CameraItemMissing as exc:
+                                if exc.path != entry['path']:
+                                    raise
+                                # No delete was issued. Recheck the saved backup,
+                                # then account for absence separately from matching
+                                # originals and acknowledged deletions. Never add a
+                                # deletion receipt: a later retry must recheck it.
+                                verify_backup(original_present=False)
+                                with engine.lock:
+                                    cleanup['missing_files']+=1
+                                    cleanup['missing_bytes']+=entry['size']
+                                    cleanup['total_bytes']-=entry['size']
+                                    if len(cleanup['missing_paths'])<50:
+                                        cleanup['missing_paths']=cleanup['missing_paths']+[entry['path']]
+                                    engine.checkpoint(job)
+                                continue
                         else:
                             # The root helper validates and hashes both files itself,
                             # then briefly remounts only this managed source for unlink.
@@ -172,7 +193,8 @@ def run(engine,job,request):
                     with engine.lock:
                         cleanup.update(files=cleanup['files']+1,bytes=cleanup['bytes']+entry['size'])
                         engine.checkpoint(job)
-        with engine.lock: cleanup.update(state='complete',current='')
+        with engine.lock:
+            cleanup.update(state='complete_with_missing' if cleanup['missing_files'] else 'complete',current='')
     except Cancelled:
         with engine.lock: cleanup.update(state='cancelled',error='Deletion stopped. Files already deleted are recorded; remaining originals were kept.')
     except Exception as exc:

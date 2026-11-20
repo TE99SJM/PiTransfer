@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from camera_worker import download, entries, file_info, estimate, detect_ports, delete_verified
+from camera_worker import download, entries, file_info, estimate, detect_ports, delete_verified, stat_path
 
 try:
     import gphoto2 as gp
@@ -71,6 +71,12 @@ class NativeCameraTest(unittest.TestCase):
         result = entries(self.camera, "")
         self.assertEqual([item["name"] for item in result], ["DCIM", "photo.JPG"])
         self.assertNotIn("do-not-preview", str(result))
+
+    def test_successful_native_listing_can_report_absent_file(self):
+        (self.root / 'existing.MP4').write_bytes(b'keep')
+        self.assertEqual(stat_path(gp,self.camera,'absent.THM',missing_ok=True),{'kind':'missing'})
+        self.assertEqual(stat_path(gp,self.camera,'existing.MP4',missing_ok=True)['size'],4)
+        with self.assertRaises(FileNotFoundError):stat_path(gp,self.camera,'absent.THM')
 
     def test_changed_size_fails_before_requesting_bytes(self):
         (self.root / "photo.RAW").write_bytes(b"original")

@@ -10,7 +10,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from camera import Cameras
+from camera import Cameras, CameraItemMissing
 from core import Transfers, Cancelled, Hardware
 import drive_helper as helper
 from tests.test_cameras import DEVICE, FakeCamera
@@ -19,7 +19,9 @@ from tests.test_transfer import FakeHardware
 
 class DeletableCamera(FakeCamera):
     def delete_verified(self,path,record,verify_backup,check,progress):
-        check();data=self.files[path]
+        check()
+        if path not in self.files: raise CameraItemMissing(path)
+        data=self.files[path]
         if (len(data),hashlib.sha256(data).hexdigest())!=(record['size'],record['sha256']):
             raise RuntimeError('Original checksum changed; kept')
         progress(len(data));verify_backup();check();del self.files[path]
@@ -120,10 +122,67 @@ class CleanupTest(unittest.TestCase):
         result=self.delete(job);self.assertEqual(result['cleanup']['state'],'complete')
         self.assertTrue((self.hw.dst/job['destination']/'data/first.MP4').exists())
 
-    def test_missing_source_and_backup_symlink_fail_closed(self):
+    def test_missing_camera_source_checks_backup_and_continues_without_claiming_deletion(self):
         job=self.copy();del self.camera.files['first.MP4']
-        result=self.delete(job);self.assertEqual(result['cleanup']['state'],'failed');self.assertIn('second.MP4',self.camera.files)
-        self.camera.files['first.MP4']=b'first'
+        result=self.delete(job);c=result['cleanup']
+        self.assertEqual(c['state'],'complete_with_missing',result)
+        self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(1,1,1))
+        self.assertEqual(c['bytes'],6);self.assertEqual(c['missing_bytes'],5)
+        self.assertEqual(c['phase_bytes'],17);self.assertEqual(c['total_bytes'],17)
+        self.assertEqual(c['missing_paths'],['first.MP4']);self.assertEqual(self.camera.files,{})
+        audit=(self.hw.dst/job['destination']/'deleted.jsonl').read_text().splitlines()
+        self.assertEqual([json.loads(line)['path'] for line in audit],['second.MP4'])
+        self.engine=Transfers(self.hw,self.root/'history.json')
+        self.assertEqual(self.engine.snapshot()[0]['cleanup'],c)
+        self.assertTrue(result['can_delete'])
+
+    def test_absent_camera_file_with_missing_or_changed_backup_stops_before_next_delete(self):
+        job=self.copy();del self.camera.files['first.MP4']
+        backup=self.hw.dst/job['output_folders'][0]/'first.MP4'
+        for changed in (True,False):
+            if changed:backup.write_bytes(b'corrupt')
+            else:backup.unlink()
+            result=self.delete(job);c=result['cleanup']
+            self.assertEqual(c['state'],'failed',result)
+            self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(0,0,0))
+            self.assertIn('second.MP4',self.camera.files)
+
+    def test_camera_errors_and_generic_missing_exceptions_are_not_treated_as_absence(self):
+        job=self.copy()
+        for error in (RuntimeError('PTP General Error'),FileNotFoundError('Disconnected USB'),CameraItemMissing('wrong-path')):
+            with patch.object(self.camera,'delete_verified',side_effect=error):result=self.delete(job)
+            self.assertEqual(result['cleanup']['state'],'failed',result)
+            self.assertEqual(result['cleanup']['missing_files'],0)
+            self.assertEqual(len(self.camera.files),2)
+
+    def test_all_absent_can_be_rechecked_and_reappearing_original_must_match(self):
+        job=self.copy();self.camera.files.clear()
+        result=self.delete(job);c=result['cleanup']
+        self.assertEqual(c['state'],'complete_with_missing')
+        self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(0,0,2))
+        self.assertEqual((c['phase_bytes'],c['total_bytes']),(11,11))
+        self.assertEqual((self.hw.dst/job['destination']/'deleted.jsonl').read_bytes(),b'')
+        self.camera.files['first.MP4']=b'wrong'
+        result=self.delete(job);self.assertEqual(result['cleanup']['state'],'failed')
+        self.assertEqual(self.camera.files['first.MP4'],b'wrong')
+        self.camera.files.update({'first.MP4':b'first','second.MP4':b'second'})
+        result=self.delete(job);self.assertEqual(result['cleanup']['state'],'complete')
+        self.assertEqual(result['cleanup']['files'],2)
+
+    def test_camera_removing_companion_file_is_reported_separately(self):
+        self.camera.files={'clip.MP4':b'video','clip.THM':b'thumbnail','other.MP4':b'other'}
+        job=self.copy();original=self.camera.delete_verified
+        def remove_companion(path,*args):
+            original(path,*args)
+            if path=='clip.MP4':self.camera.files.pop('clip.THM')
+        with patch.object(self.camera,'delete_verified',side_effect=remove_companion):result=self.delete(job)
+        self.assertEqual(result['cleanup']['state'],'complete_with_missing',result)
+        self.assertEqual(result['cleanup']['files'],2)
+        self.assertEqual(result['cleanup']['missing_paths'],['clip.THM'])
+        token=self.engine.prepare_delete(job['id']);self.assertEqual(token['files'],1)
+
+    def test_backup_symlink_fails_closed(self):
+        job=self.copy()
         backup=self.hw.dst/job['output_folders'][0]/'first.MP4'
         outside=self.root/'other';outside.write_bytes(b'first');backup.unlink();backup.symlink_to(outside)
         result=self.delete(job);self.assertEqual(result['cleanup']['state'],'failed');self.assertEqual(len(self.camera.files),2)
@@ -229,6 +288,13 @@ class CameraDeleteProtocolTest(unittest.TestCase):
             def failed():raise RuntimeError('NAS changed')
             with self.assertRaises(RuntimeError):self.source.delete_verified('clip.MP4',record,failed,lambda:None,lambda n:None)
             self.assertTrue(self.file.exists())
+
+    def test_confirmed_absence_never_starts_delete_worker(self):
+        source=self.backend.source(DEVICE)
+        with patch.object(self.backend,'request',return_value={'kind':'missing'}), patch('camera.subprocess.Popen') as spawn:
+            with self.assertRaises(CameraItemMissing) as caught:
+                source.delete_verified('clip.MP4',self.record,lambda:None,lambda:None,lambda n:None)
+            self.assertEqual(caught.exception.path,'clip.MP4');spawn.assert_not_called()
 
 
 class DiskDeleteTest(unittest.TestCase):

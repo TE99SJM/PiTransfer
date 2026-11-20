@@ -274,6 +274,30 @@ def main():
                     expect(legacy_card.locator('.copy-progress')).to_have_attribute('value','100')
                     assert camera.files['note.txt']==b'changed original'
 
+                    # Missing originals are separate from acknowledged deletions.
+                    # Reuse the real transfer record and keep its NAS checksum valid.
+                    del camera.files['note.txt']
+                    page.once('dialog',lambda dialog:dialog.accept('DELETE 1'))
+                    legacy_card.get_by_role('button',name='Delete verified originals').click()
+                    expect(legacy_card.locator('.cleanup-status')).to_contain_text('0 originals deleted; 1 already absent')
+                    expect(legacy_card.locator('.verification-progress')).to_have_attribute('value','100')
+                    expect(legacy_card.locator('.deletion-progress')).to_have_attribute('value','0')
+                    expect(legacy_card.locator('.cleanup-missing')).to_contain_text('not counted as deleted')
+                    legacy_card.locator('.cleanup-missing summary').click()
+                    expect(legacy_card.locator('.cleanup-missing .path')).to_have_text('note.txt')
+                    page.evaluate('renderJobs(jobsState)')
+                    expect(legacy_card.locator('.cleanup-missing')).to_have_attribute('open','')
+                    expect(legacy_card.get_by_role('button',name='Recheck remaining originals')).to_be_enabled()
+                    page.reload()
+                    expect(legacy_card.locator('.cleanup-status')).to_contain_text('1 already absent')
+                    page.once('dialog',lambda dialog:dialog.dismiss())
+                    legacy_card.get_by_role('button',name='Recheck remaining originals').click()
+                    expect(legacy_card.locator('.cleanup-status')).to_contain_text('Confirmation was cancelled')
+                    mixed=page.evaluate("cleanupProgress({state:'complete_with_missing',total_files:3,files:2,missing_files:1,verified_files:2,phase_bytes:25,total_bytes:25})")
+                    assert mixed['deletion']['percent']==100
+                    assert '2 of 2 available originals deleted' in mixed['deletion']['detail']
+                    assert '1 already absent' in mixed['deletion']['detail']
+
                     page.set_viewport_size({"width":390,"height":844})
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'
                     assert not errors, errors

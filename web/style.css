@@ -8,4 +8,6 @@
 
 .job .pill.organizing,.job .pill.deleting{background:#fff3d8;color:#83601b}.job>button{margin:6px 8px 0 0}.cleanup-error{color:var(--danger)}
 
-.cleanup-section{margin-top:18px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#f9fcf8}.cleanup-section h3{font-size:15px;margin:0 0 6px}.cleanup-section .cleanup-status{font-size:13px;font-weight:600}.cleanup-section.failed,.cleanup-section.interrupted,.cleanup-section.cancelled{border-color:#d6ac9a;background:#fff9f3}.cleanup-section.failed .transfer-progress{accent-color:var(--danger)}.cleanup-section.complete{border-color:#9aba9a}.cleanup-section .progress-heading{margin-top:12px}.cleanup-section button{margin-top:8px}
+.cleanup-section{margin-top:18px;padding:16px;border:1px solid var(--line);border-radius:12px;background:#f9fcf8}.cleanup-section h3{font-size:15px;margin:0 0 6px}.cleanup-section .cleanup-status{font-size:13px;font-weight:600}.cleanup-section.failed,.cleanup-section.interrupted,.cleanup-section.cancelled,.cleanup-section.complete_with_missing{border-color:#d6ac9a;background:#fff9f3}.cleanup-section.failed .transfer-progress{accent-color:var(--danger)}.cleanup-section.complete{border-color:#9aba9a}.cleanup-section .progress-heading{margin-top:12px}.cleanup-section button{margin-top:8px}
+
+.cleanup-missing{font-size:12px;margin:12px 0}.cleanup-missing summary{cursor:pointer;font-weight:600}

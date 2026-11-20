@@ -10,6 +10,13 @@ import sys
 import time
 
 
+class CameraItemMissing(RuntimeError):
+    """A successful listing of the original's parent did not contain it."""
+    def __init__(self, path):
+        self.path = path
+        super().__init__('Camera item is no longer present: ' + path)
+
+
 class Cameras:
     def __init__(self):
         self.command = [sys.executable, "-I", str(Path(__file__).with_name("camera_worker.py"))]
@@ -95,7 +102,10 @@ class CameraSource:
         return self.backend.request("list", device=self.device, path=path, offset=offset)
 
     def stat(self, path):
-        return self.backend.request("stat", device=self.device, path=path)
+        result = self.backend.request("stat", device=self.device, path=path)
+        if result == {"kind": "missing"}:
+            raise CameraItemMissing(path)
+        return result
 
     def estimate(self, paths, check, progress):
         pending = b""

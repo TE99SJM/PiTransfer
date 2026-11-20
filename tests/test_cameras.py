@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from camera import Cameras
-from camera_worker import components, discover, entries, identity, open_camera, safe_name
+from camera_worker import components, discover, entries, identity, open_camera, safe_name, stat_path
 from core import Cancelled, Hardware, Transfers
 from tests.test_transfer import FakeHardware
 
@@ -216,6 +216,17 @@ class CameraTransfersTest(unittest.TestCase):
 
 
 class CameraWorkerTest(unittest.TestCase):
+    def test_absence_requires_successful_listing_and_not_metadata_error(self):
+        gp=Mock();camera=Mock()
+        with patch('camera_worker.entries',return_value=[]):
+            self.assertEqual(stat_path(gp,camera,'clip.THM',missing_ok=True),{'kind':'missing'})
+            with self.assertRaises(FileNotFoundError):stat_path(gp,camera,'clip.THM')
+        for error in (RuntimeError('PTP General Error'),FileNotFoundError('Folder unavailable')):
+            with patch('camera_worker.entries',side_effect=error),self.assertRaises(type(error)):
+                stat_path(gp,camera,'clip.THM',missing_ok=True)
+        with patch('camera_worker.entries',return_value=[{'name':'clip.THM','kind':'file'}]),patch('camera_worker.file_info',side_effect=RuntimeError('unreadable')):
+            with self.assertRaisesRegex(RuntimeError,'unreadable'):stat_path(gp,camera,'clip.THM',missing_ok=True)
+
     def test_metadata_only_listing_and_duplicate_rejection(self):
         camera = Mock()
         camera.folder_list_folders.return_value = [("DCIM", 0)]
