@@ -138,6 +138,13 @@ def run(engine,job,request):
                 with engine.lock:
                     cleanup.update(total_bytes=2*sum(e['size'] for e in entries),previous_deleted_files=len(deleted))
                 source=engine.hardware.camera_source(request['device']) if request['device'].startswith('camera:') else None
+                if source:
+                    # Process transferred thumbnails/proxies before primary media.
+                    # A camera may invalidate companion objects when a video is
+                    # deleted, breaking later PTP enumeration. Reorder only the
+                    # confirmed manifest entries; keep every per-file hash gate
+                    # and never interpret a driver error as proof of absence.
+                    entries=sorted(entries,key=lambda e:not e['path'].lower().endswith(('.thm','.lrv')))
                 for entry in entries:
                     engine.check()
                     with engine.lock:

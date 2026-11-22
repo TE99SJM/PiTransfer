@@ -66,9 +66,11 @@ class CleanupTest(unittest.TestCase):
 
     def test_verified_camera_delete_keeps_nas_and_unselected_files(self):
         self.camera.files['untouched.RAW']=b'unselected'
+        self.camera.files['first.THM']=b'unselected thumbnail'
         job=self.copy(paths=['first.MP4']);result=self.delete(job)
         self.assertEqual(result['cleanup']['state'],'complete',result)
         self.assertNotIn('first.MP4',self.camera.files);self.assertIn('untouched.RAW',self.camera.files)
+        self.assertEqual(self.camera.files['first.THM'],b'unselected thumbnail')
         self.assertEqual((self.hw.dst/job['output_folders'][0]/'first.MP4').read_bytes(),b'first')
         audit=(self.hw.dst/job['destination']/'deleted.jsonl').read_text()
         self.assertEqual(json.loads(audit)['path'],'first.MP4');self.assertFalse(result['can_delete'])
@@ -170,17 +172,91 @@ class CleanupTest(unittest.TestCase):
         result=self.delete(job);self.assertEqual(result['cleanup']['state'],'complete')
         self.assertEqual(result['cleanup']['files'],2)
 
-    def test_camera_removing_companion_file_is_reported_separately(self):
-        self.camera.files={'clip.MP4':b'video','clip.THM':b'thumbnail','other.MP4':b'other'}
+    def test_camera_file_disappearing_during_cleanup_is_reported_separately(self):
+        self.camera.files={'clip.MP4':b'video','other.MP4':b'other'}
         job=self.copy();original=self.camera.delete_verified
-        def remove_companion(path,*args):
+        def remove_other(path,*args):
             original(path,*args)
-            if path=='clip.MP4':self.camera.files.pop('clip.THM')
-        with patch.object(self.camera,'delete_verified',side_effect=remove_companion):result=self.delete(job)
+            if path=='clip.MP4':self.camera.files.pop('other.MP4')
+        with patch.object(self.camera,'delete_verified',side_effect=remove_other):result=self.delete(job)
         self.assertEqual(result['cleanup']['state'],'complete_with_missing',result)
-        self.assertEqual(result['cleanup']['files'],2)
-        self.assertEqual(result['cleanup']['missing_paths'],['clip.THM'])
+        self.assertEqual(result['cleanup']['files'],1)
+        self.assertEqual(result['cleanup']['missing_paths'],['other.MP4'])
         token=self.engine.prepare_delete(job['id']);self.assertEqual(token['files'],1)
+
+    def test_camera_sidecars_are_verified_and_deleted_before_videos_can_invalidate_them(self):
+        # Model a camera whose file listing breaks after deleting a video with
+        # remaining companions. This is a regression simulation, not a claim
+        # that every GoPro firmware behaves this way.
+        self.camera.folders={'','DCIM','DCIM/100GOPRO','DCIM/101GOPRO'}
+        originals={
+            'DCIM/100GOPRO/GX010001.MP4':b'video one',
+            'DCIM/100GOPRO/GX010001.THM':b'thumbnail one',
+            'DCIM/100GOPRO/GL010001.LRV':b'proxy one',
+            'DCIM/101GOPRO/GX010002.mp4':b'video two',
+            'DCIM/101GOPRO/GX010002.tHm':b'thumbnail two',
+            'DCIM/101GOPRO/GL010002.lrv':b'proxy two',
+        }
+        self.camera.files=dict(originals)
+        job=self.copy(layout='original');original=self.camera.delete_verified
+        order=[];broken=[False]
+        def delete_with_stale_metadata(path,*args):
+            if broken[0]:raise RuntimeError('PTP General Error (0x2002): GetObjectInfo')
+            original(path,*args);order.append(path)
+            if path.lower().endswith('.mp4'):
+                broken[0]=any(p.lower().endswith(('.thm','.lrv')) for p in self.camera.files)
+        with patch.object(self.camera,'delete_verified',side_effect=delete_with_stale_metadata):result=self.delete(job)
+        self.assertEqual(result['cleanup']['state'],'complete',result)
+        self.assertFalse(broken[0]);self.assertEqual(self.camera.files,{})
+        self.assertTrue(all(p.lower().endswith(('.thm','.lrv')) for p in order[:4]))
+        c=result['cleanup'];total=sum(map(len,originals.values()))
+        self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(6,6,0))
+        self.assertEqual((c['bytes'],c['phase_bytes'],c['total_bytes']),(total,2*total,2*total))
+        workspace=self.hw.dst/job['destination']
+        audit=[json.loads(line) for line in (workspace/'deleted.jsonl').read_text().splitlines()]
+        self.assertEqual([r['path'] for r in audit],order)
+        for record in audit:
+            data=originals[record['path']]
+            self.assertEqual((record['size'],record['sha256']),(len(data),hashlib.sha256(data).hexdigest()))
+            self.assertEqual((workspace/'data'/record['path']).read_bytes(),data)
+
+    def test_sidecar_verification_failure_keeps_video_and_thumbnail(self):
+        self.camera.files={'clip.MP4':b'video','clip.THM':b'thumbnail'}
+        job=self.copy(layout='original');backup=self.hw.dst/job['destination']/'data/clip.THM'
+        for target in ('source','nas','missing_nas','ptp'):
+            with self.subTest(target=target):
+                self.camera.files={'clip.MP4':b'video','clip.THM':b'thumbnail'}
+                backup.write_bytes(b'thumbnail')
+                if target=='source':self.camera.files['clip.THM']=b'changed!'
+                elif target=='nas':backup.write_bytes(b'corrupt!!')
+                elif target=='missing_nas':backup.unlink()
+                original=self.camera.delete_verified
+                def fail_thumbnail(path,*args):
+                    if target=='ptp' and path.endswith('.THM'):
+                        raise RuntimeError('PTP General Error')
+                    return original(path,*args)
+                with patch.object(self.camera,'delete_verified',side_effect=fail_thumbnail):result=self.delete(job)
+                c=result['cleanup']
+                self.assertEqual(c['state'],'failed',result)
+                self.assertEqual((c['files'],c['verified_files'],c['missing_files']),(0,0,0))
+                self.assertEqual(set(self.camera.files),{'clip.MP4','clip.THM'})
+                self.assertEqual((self.hw.dst/job['destination']/'deleted.jsonl').read_bytes(),b'')
+
+    def test_sidecar_retry_handles_prior_receipts_and_absence_without_redeleting(self):
+        self.camera.files={'clip.MP4':b'video','clip.THM':b'thumbnail','old.THM':b'old thumbnail'}
+        job=self.copy();del self.camera.files['old.THM'];original=self.camera.delete_verified
+        def cancel_after_delete(*args):original(*args);self.engine.cancel_event.set()
+        with patch.object(self.camera,'delete_verified',side_effect=cancel_after_delete):result=self.delete(job)
+        self.assertEqual(result['cleanup']['state'],'cancelled',result)
+        self.assertEqual(self.camera.files,{'clip.MP4':b'video'})
+        self.engine=Transfers(self.hw,self.root/'history.json')
+        result=self.delete(self.engine.snapshot()[0]);c=result['cleanup']
+        self.assertEqual(c['state'],'complete_with_missing',result)
+        self.assertEqual((c['files'],c['verified_files'],c['missing_files'],c['previous_deleted_files']),(1,1,1,1))
+        self.assertEqual(c['missing_paths'],['old.THM'])
+        self.assertEqual(self.camera.files,{})
+        audit=(self.hw.dst/job['destination']/'deleted.jsonl').read_text().splitlines()
+        self.assertEqual([json.loads(line)['path'] for line in audit],['clip.THM','clip.MP4'])
 
     def test_backup_symlink_fails_closed(self):
         job=self.copy()
