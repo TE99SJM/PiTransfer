@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from camera import Cameras
-from camera_worker import components, discover, entries, identity, open_camera, safe_name, stat_path
+from camera_worker import components, discover, entries, history_key, identity, open_camera, safe_name, stat_path
 from core import Cancelled, Hardware, Transfers
 from tests.test_transfer import FakeHardware
 
@@ -124,6 +124,29 @@ class CameraTransfersTest(unittest.TestCase):
         self.assertEqual(len(result["items"]), 2)
         self.assertEqual(self.camera.opened, [])
         self.assertNotIn("original-camera-bytes", json.dumps(result))
+
+    def test_history_identity_persists_and_backfills_only_exact_connections(self):
+        stable='camera:'+'a'*64
+        found={'id':DEVICE,'label':'GoPro HERO9 Black','node':'usb:001,003','history_key':stable,'usable':True}
+        self.hw.devices=lambda:[found]
+        self.engine.devices()
+        job=self.run_job(['note.txt'])
+        self.assertEqual(job['device_history_key'],stable)
+        self.engine=Transfers(self.hw,Path(self.temp.name)/'history.json')
+        self.assertEqual(self.engine.snapshot()[0]['device_history_key'],stable)
+        legacy=self.engine.jobs[0]
+        legacy.pop('device_history_key');legacy['device_label']='USB camera'
+        # A same-model camera on a different connection cannot identify an old
+        # record which has no saved serial-derived display key.
+        found=dict(found,id='camera:001:009:aaaaaaaaaaaaaaaa')
+        self.engine.devices()
+        self.assertNotIn('device_history_key',legacy)
+        found=dict(found,id=DEVICE)
+        self.engine.device_cache_time=0;self.engine.devices()
+        self.assertEqual(legacy['device_history_key'],stable)
+        self.assertEqual(legacy['device_label'],'GoPro HERO9 Black')
+        self.engine=Transfers(self.hw,Path(self.temp.name)/'history.json')
+        self.assertEqual(self.engine.snapshot()[0]['device_history_key'],stable)
 
     def test_nested_selection_and_parent_deduplication(self):
         for paths in (["DCIM/100GOPRO/photo.RAW"], ["DCIM", "DCIM/100GOPRO/photo.RAW"]):
@@ -261,10 +284,32 @@ class CameraWorkerTest(unittest.TestCase):
 
     def test_discovery_accepts_only_identified_usb_cameras(self):
         gp = SimpleNamespace(Camera=SimpleNamespace(autodetect=lambda: [("GoPro", "usb:001,003"), ("GoPro", "usb:001,003"), ("Directory", "disk:/etc")]))
-        with patch("camera_worker.identity", side_effect=lambda model, port: DEVICE if port.startswith("usb:") else None):
+        with patch("camera_worker.identity", side_effect=lambda model, port: DEVICE if port.startswith("usb:") else None), \
+                patch('camera_worker.history_key',return_value='camera:'+'a'*64):
             devices = discover(gp)
         self.assertEqual(len(devices), 1)
         self.assertEqual(devices[0]["id"], DEVICE)
+        self.assertEqual(devices[0]['history_key'],'camera:'+'a'*64)
+
+    def test_history_key_survives_reconnection_without_weakening_usb_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);dev=root/'1-2';dev.mkdir()
+            for name,value in {'busnum':'1','devnum':'3','idVendor':'2672','idProduct':'004d','serial':'camera-one'}.items():
+                (dev/name).write_text(value)
+            first=history_key('usb:001,003',root);connection=identity('Camera','usb:001,003',root)
+            self.assertIsNotNone(first);self.assertNotIn('camera-one',first)
+            (dev/'devnum').write_text('9')
+            self.assertEqual(history_key('usb:001,009',root),first)
+            self.assertNotEqual(identity('Camera','usb:001,009',root),connection)
+            self.assertIsNone(identity('Camera','usb:001,003',root))
+            (dev/'serial').write_text('camera-two')
+            self.assertNotEqual(history_key('usb:001,009',root),first)
+            for serial in ('','00000000'):
+                (dev/'serial').write_text(serial)
+                self.assertIsNone(history_key('usb:001,009',root))
+            (dev/'serial').unlink()
+            self.assertIsNone(history_key('usb:001,009',root))
+            self.assertIsNone(history_key('disk:/etc',root))
 
     def test_stale_camera_never_opened(self):
         gp = Mock()

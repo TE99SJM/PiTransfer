@@ -34,6 +34,7 @@ def main():
         cameras = {DEVICE:camera}
         hardware.camera_source = lambda device: cameras[device]
         available = [{"id": DEVICE, "label": "GoPro HERO9 Black", "kind": "camera",
+                                     "history_key": 'camera:'+'a'*64,
                                      "size": None, "node": "usb:001,003", "filesystem": "PTP/MTP",
                                      "usable": True, "mounted": False}]
         hardware.devices = lambda exclude=None: [d for d in available if d['node'] not in (exclude or [])]
@@ -146,6 +147,23 @@ def main():
                     expect(legacy_card.get_by_role('button',name='Organize by date')).to_have_count(0)
                     assert failed['publication_complete'],failed
                     assert camera.opened==downloads,'Organizing read original media again'
+                    expect(page.locator('#jobs .device-group')).to_have_count(1)
+                    expect(page.locator('#jobs .device-group-heading h3')).to_have_text('GoPro HERO9 Black')
+                    expect(page.locator('#jobs .device-group .job')).to_have_count(2)
+                    expect(page.locator('#jobs .device-group-heading p')).to_have_text('2 transfers')
+                    expect(legacy_card.locator('.job-top strong')).to_contain_text('Transfer ·')
+                    expect(legacy_card.locator('.selection-summary')).to_have_count(0)  # Old saved selection is unknown.
+                    # Same physical camera after a reconnect shares a group;
+                    # same model with a different identity does not.
+                    grouped=page.evaluate('''() => groupTransfers([
+                        {id:'new',device:'camera:new',device_history_key:'serial-a',device_label:'GoPro HERO9 Black'},
+                        {id:'other',device:'camera:other',device_history_key:'serial-b',device_label:'GoPro HERO9 Black'},
+                        {id:'old',device:'camera:old',device_history_key:'serial-a',device_label:'GoPro HERO9 Black'},
+                        {id:'legacy',device:'camera:old',device_label:'USB camera'}
+                    ], []).map(g=>({label:g.label,ids:g.jobs.map(j=>j.id)}))''')
+                    assert grouped==[{'label':'GoPro HERO9 Black','ids':['new','old','legacy']},
+                                     {'label':'GoPro HERO9 Black','ids':['other']}]
+                    assert page.evaluate("groupTransfers([{id:'a',device:'camera:1',device_label:'Same model'},{id:'b',device:'camera:2',device_label:'Same model'}],[]).length")==2
 
                     # A progress bar exists for old resume jobs and for every camera.
                     assert abs(page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") - 28) < 1e-9
@@ -153,7 +171,7 @@ def main():
                     assert abs(page.evaluate("jobProgress({state:'copying',total_files:4,files:1,unknown_files:1,bytes:10}).percent") - 25) < 1e-9
                     second = 'camera:002:004:aaaaaaaaaaaaaaaa'
                     cameras[second] = FakeCamera()
-                    available.append(dict(available[0], id=second, label='Second USB camera', node='usb:002,004'))
+                    available.append(dict(available[0], id=second, label='Second USB camera', node='usb:002,004',history_key='camera:'+'b'*64))
                     gate, entered = threading.Event(), threading.Event()
                     original_stream = camera.stream
                     @contextlib.contextmanager
@@ -186,6 +204,10 @@ def main():
                         expect(running_card.locator('.pill')).to_have_text('complete',timeout=15000)
                         expect(queued_card.locator('.copy-progress')).to_have_attribute('value','100')
                         expect(page.locator('#jobs .copy-progress')).to_have_count(len(application.transfers.snapshot()))
+                        expect(page.locator('#jobs .device-group')).to_have_count(2)
+                        same_camera=page.locator('#jobs .device-group').filter(has=page.locator('.device-group-heading h3',has_text='GoPro HERO9 Black'))
+                        expect(same_camera.locator('.job')).to_have_count(3)
+                        expect(same_camera.locator('.copy-progress')).to_have_count(3)
                     finally:
                         gate.set()
                         camera.stream = original_stream
@@ -197,19 +219,25 @@ def main():
                     expect(copied_card.locator('.verification-progress')).to_have_attribute('value','0')
                     expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
                     expect(copied_card.locator('.cleanup-status')).to_contain_text('Not started')
-                    page.once('dialog',lambda dialog:dialog.dismiss())
+                    deletion_requests=[]
+                    page.on('request',lambda request:deletion_requests.append(request) if request.url.endswith('/api/delete/confirm') else None)
+                    def cancel_delete(dialog):
+                        assert dialog.type=='confirm', 'Deletion should use OK/Cancel, not a text prompt'
+                        assert 'delete 2 original files' in dialog.message
+                        assert 'GoPro HERO9 Black' in dialog.message and 'MiB' in dialog.message
+                        dialog.dismiss()
+                    page.once('dialog',cancel_delete)
                     delete.click()
                     expect(delete).to_be_enabled()
                     assert 'DCIM/100GOPRO/photo.RAW' in camera.files
                     expect(copied_card.locator('.cleanup-status')).to_contain_text('Confirmation was cancelled')
-                    page.once('dialog',lambda dialog:dialog.accept('wrong'))
-                    delete.click()
-                    expect(page.locator('#notice')).to_contain_text('Nothing was deleted')
-                    expect(delete).to_be_enabled()
+                    assert deletion_requests==[], 'Cancel sent a deletion request'
                     def confirm_delete(dialog):
-                        assert '2 verified originals' in dialog.message
+                        assert dialog.type=='confirm'
+                        assert 'delete 2 original files' in dialog.message
+                        assert 'Click OK to verify and delete' in dialog.message
                         assert 'NAS copies are kept' in dialog.message
-                        dialog.accept('DELETE 2')
+                        dialog.accept()
                     # Hold verification and deletion separately to inspect live bars.
                     started,checked=threading.Event(),threading.Event()
                     finish_check,finish_delete=threading.Event(),threading.Event()
@@ -247,6 +275,7 @@ def main():
                     assert 'DCIM/100GOPRO/photo.RAW' not in camera.files
                     assert 'DCIM/100GOPRO/clip.MP4' not in camera.files
                     assert 'note.txt' in camera.files
+                    assert len(deletion_requests)==1, 'OK should start exactly one deletion operation'
                     assert (hardware.dst/job['output_folders'][0]/'photo.RAW').read_bytes()==b'raw'
                     expect(delete).to_have_count(0)
                     expect(copied_card.locator('.verification-progress')).to_have_attribute('value','100')
@@ -266,7 +295,11 @@ def main():
 
                     # A deletion failure must be visible separately from the completed copy.
                     camera.files['note.txt']=b'changed original'
-                    page.once('dialog',lambda dialog:dialog.accept('DELETE 1'))
+                    def confirm_one_delete(dialog):
+                        assert dialog.type=='confirm'
+                        assert 'delete 1 original file (' in dialog.message
+                        dialog.accept()
+                    page.once('dialog',confirm_one_delete)
                     legacy_card.get_by_role('button',name='Delete verified originals').click()
                     expect(legacy_card.locator('.cleanup-status')).to_contain_text('Deletion stopped with an error')
                     expect(legacy_card.locator('.cleanup-error')).to_contain_text('Original checksum changed')
@@ -277,7 +310,7 @@ def main():
                     # Missing originals are separate from acknowledged deletions.
                     # Reuse the real transfer record and keep its NAS checksum valid.
                     del camera.files['note.txt']
-                    page.once('dialog',lambda dialog:dialog.accept('DELETE 1'))
+                    page.once('dialog',confirm_one_delete)
                     legacy_card.get_by_role('button',name='Delete verified originals').click()
                     expect(legacy_card.locator('.cleanup-status')).to_contain_text('0 originals deleted; 1 already absent')
                     expect(legacy_card.locator('.verification-progress')).to_have_attribute('value','100')

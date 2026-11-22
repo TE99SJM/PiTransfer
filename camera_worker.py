@@ -82,6 +82,27 @@ def detect_ports(gp, exclude=(), only=None):
     return list(abilities.detect(selected)) if selected.count() else []
 
 
+def history_key(port, sysroot=Path("/sys/bus/usb/devices")):
+    """Display-only identity across reconnects; never used to open a camera."""
+    match = USB_PORT.fullmatch(port)
+    if not match:
+        return None
+    bus, address = map(int, match.groups())
+    for dev in sysroot.iterdir():
+        try:
+            if int((dev / "busnum").read_text()) != bus or int((dev / "devnum").read_text()) != address:
+                continue
+            serial = (dev / "serial").read_text().strip()
+            if not serial or not serial.strip('0'):
+                return None  # Never group different cameras just by model/port.
+            signature = [(dev / "idVendor").read_text().strip(),
+                         (dev / "idProduct").read_text().strip(), serial]
+            return "camera:" + hashlib.sha256(json.dumps(signature).encode()).hexdigest()
+        except (OSError, ValueError):
+            continue
+    return None
+
+
 def discover(gp, exclude=(), only=None):
     devices = []
     seen = set()
@@ -91,6 +112,7 @@ def discover(gp, exclude=(), only=None):
         if device and port not in seen:
             seen.add(port)
             devices.append({"id": device, "label": model, "node": port,
+                            "history_key": history_key(port),
                             "kind": "camera", "filesystem": "PTP/MTP", "size": None,
                             "usable": True, "mounted": False, "reason": ""})
     return devices

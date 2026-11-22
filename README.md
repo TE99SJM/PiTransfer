@@ -58,7 +58,7 @@ One worker serializes copying, organizing, source browsing and deletion. Camera 
 
 A completed transfer shows its **Copy complete** bar and a separate **Verify and delete originals** section. The **Verification** bar tracks bytes read from both originals and NAS copies plus the number of matching file pairs. The **Deletion** bar counts originals whose deletion was acknowledged and recorded. Both remain visible after completion or a stopped/failed operation, with the current filename and any error. They update once a second and show “Not started” until you explicitly begin. Confirmed completion reaches 100%; reading all bytes without a matching checksum does not count as successful verification.
 
-The section exposes **Delete verified originals**. Reconnect/select the original camera or USB drive if needed. The confirmation shows the source, file count and byte total and requires typing `DELETE N`. Only files in that completed transfer's verified manifest are eligible. No deletion starts automatically after copying, closing the window, or restarting the Pi.
+The section exposes **Delete verified originals**. Reconnect/select the original camera or USB drive if needed. A popup shows the source, file count and byte total. Click **OK** to start verification and deletion, or **Cancel** to keep the originals; no typing is required. Only files in that completed transfer's verified manifest are eligible. No deletion starts automatically after copying, closing the window, or restarting the Pi.
 
 For each file the app freshly checks SHA-256 and size of both the original and NAS backup before issuing a single-file delete. Changed, unsupported, linked or unreadable files and missing NAS backups stop the operation; unselected files, skipped items, directories and NAS backups are never deleted. Camera verification and deletion share one open camera session. Disk sources are verified while read-only; the root helper also independently validates the encrypted NAS mount, briefly remounts only the managed source writable for the exact unlink, and restores read-only protection. Filesystems/cards that reject a safe writable remount (including some journal-disabled or NTFS mounts) cannot be deleted through this action. If read-only restoration fails, the helper attempts to unmount the source and reports the failure.
 
@@ -70,7 +70,9 @@ Cancelled/incorrect confirmations and startup errors appear directly inside the 
 
 ## Multiple devices and progress bars
 
-While one job is running, plug in another supported camera or USB drive. Its device card offers **Queue all files**. Confirm the destination and keep both devices connected. Each request immediately gets its own progress card with the camera/drive name, USB address, queue position and a waiting bar. The Pi copies them in order, one at a time, and moves to the next after completion, cancellation or failure. The waiting job counts its files and checks actual destination space when its turn starts.
+Transfer history has one heading per camera or drive, with individual imports listed underneath by time and selection. Each import keeps its own copy, verification and deletion bars and actions. Cameras with a USB serial number retain their display group across reconnects; the serial is stored only as a hash. Older records are associated when their exact saved connection is seen again. Records without a known stable identity stay grouped by their saved connection, never just by model name, so two cameras of the same model are not silently combined. Grouping changes the display only; connection checks and deletion authorization remain per transfer.
+
+While one job is running, plug in another supported camera or USB drive. Its device card offers **Queue all files**. Confirm the destination and keep both devices connected. Each request immediately gets its own progress card under that device's heading, with a queue position and a waiting bar. The Pi copies them in order, one at a time, and moves to the next after completion, cancellation or failure. The waiting job counts its files and checks actual destination space when its turn starts.
 
 Queueing copies **all accessible files** on that device. To browse and select individual files, wait until the worker is idle. Up to 10 requests can wait, with at most one active or queued request per device. **Remove from queue** cancels only that waiting request; **Cancel transfer** stops only the running job. Starting another copy or removing a queued request never clears the active job’s cancellation state. Every request retains its own NAS destination and private verification records; its files go into camera/date folders without replacing existing files.
 
@@ -162,4 +164,4 @@ Additional tests cover flat date grouping, real MP4 timestamps, timezone boundar
 - [python-gphoto2 bindings and file APIs](https://github.com/jim-easterbrook/python-gphoto2)
 - [GoPro USB connection troubleshooting](https://community.gopro.com/s/article/Camera-is-not-Recognized-when-Plugged-into-a-Computer-USB-Port?language=en_US)
 
-Version: 0.6.3
+Version: 0.6.4

@@ -243,35 +243,63 @@ function renderCleanup(row,j,label) {
   if(j.can_delete) panel.append(button(c.state==='complete_with_missing'?'Recheck remaining originals':'Delete verified originals',()=>deleteOriginals(j),'danger delete-originals'));
   row.append(panel);
 }
+function groupTransfers(jobs, connected=devices) {
+  const identities=new Map(), groups=new Map();
+  for(const d of connected) if(d.history_key) identities.set(d.id,d.history_key);
+  for(const j of jobs) if(j.device_history_key) identities.set(j.device,j.device_history_key);
+  const named=label=>label && !['USB camera','USB drive'].includes(label);
+  for(const j of jobs) {
+    const key=identities.get(j.device) || `connection:${j.device || j.id}`;
+    const current=connected.find(d=>d.id===j.device || (d.history_key && d.history_key===identities.get(j.device)));
+    const label=named(current?.label)?current.label:named(j.device_label)?j.device_label:
+      (j.device?.startsWith('camera:')?'USB camera':'USB drive');
+    if(!groups.has(key)) groups.set(key,{key,label,jobs:[]});
+    const group=groups.get(key);
+    if(!named(group.label) && named(label)) group.label=label;
+    group.jobs.push(j);
+  }
+  return [...groups.values()];
+}
 function renderJobs(jobs) {
   for(const j of jobs) if(j.state==='deleting' || j.cleanup?.state==='complete') cleanupFeedback.delete(j.id);
   const expandedMissing=new Set([...$('jobs').querySelectorAll('.cleanup-missing[open]')].map(panel=>panel.closest('.job').dataset.jobId));
   jobsState=jobs;
   busy=jobs.some(j=>activeStates.has(j.state));$('jobs').replaceChildren();
   if(!jobs.length) $('jobs').append(node('p','Your transfers will appear here.','empty'));
-  for(const j of jobs){
-    const row=node('div',undefined,'job'), top=node('div',undefined,'job-top');row.dataset.jobId=j.id;
-    const date=new Date(j.created).toLocaleString(), label=j.device_label || devices.find(d=>d.id===j.device)?.label || (j.device?.startsWith('camera:')?'USB camera':'USB drive');
-    top.append(node('strong',label),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
-    row.append(node('p',`${date} · ${j.device_node || j.device}`,'path'));
-    appendProgress(row,label,jobProgress(j),'copy-progress');
-    row.append(node('p',`${j.files} files verified · ${bytes(j.bytes)} copied${j.skipped ? ' · '+j.skipped+' skipped':''}`));
-    if(j.reused_files) row.append(node('p',`${j.reused_files} saved files rechecked · ${bytes(j.reused_bytes)} reused`));
-    if(Number.isFinite(j.total_bytes)) {
-      row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
+  for(const group of groupTransfers(jobs)) {
+    const section=node('section',undefined,'device-group');section.dataset.deviceGroup=group.key;
+    section.setAttribute('aria-label',`${group.label} transfers`);
+    const heading=node('div',undefined,'device-group-heading');
+    heading.append(node('h3',group.label));
+    const active=group.jobs.filter(j=>activeStates.has(j.state)).length;
+    heading.append(node('p',`${group.jobs.length} transfer${group.jobs.length===1?'':'s'}${active?` · ${active} active or queued`:''}`,'muted'));
+    section.append(heading);
+    for(const j of group.jobs){
+      const row=node('div',undefined,'job'), top=node('div',undefined,'job-top');row.dataset.jobId=j.id;
+      const date=new Date(j.created).toLocaleString(), label=`${group.label} · ${date}`;
+      top.append(node('strong',`Transfer · ${date}`),node('span',j.state.replaceAll('_',' '),'pill '+j.state));row.append(top);
+      if(j.paths?.length) row.append(node('p',j.paths.includes('')?'All files on this device':
+        `Selected: ${j.paths.slice(0,3).join(', ')}${j.paths.length>3?` · ${j.paths.length-3} more`:''}`,'selection-summary'));
+      appendProgress(row,label,jobProgress(j),'copy-progress');
+      row.append(node('p',`${j.files} files verified · ${bytes(j.bytes)} copied${j.skipped ? ' · '+j.skipped+' skipped':''}`));
+      if(j.reused_files) row.append(node('p',`${j.reused_files} saved files rechecked · ${bytes(j.reused_bytes)} reused`));
+      if(Number.isFinite(j.total_bytes)) {
+        row.append(node('p',`Estimated total: ${j.total_files} file(s) · ${sizeText({bytes:j.total_bytes,unknown_files:j.unknown_files||0})}`));
+      }
+      if(j.current)row.append(node('p',j.current,'path'));if(j.output_folders?.length) { for(const folder of j.output_folders) row.append(node('p',folder,'path')); } else if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
+      if(activeStates.has(j.state) && j.state!=='deleting')row.append(button(j.state==='queued'?'Remove from queue':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
+      if(j.can_resume) {
+        row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
+        row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
+      } else if(['failed','cancelled','interrupted'].includes(j.state)) {
+        row.append(node('p','This older transfer has no saved selection for resuming. Its NAS files are retained.'));
+      }
+      if(j.can_organize) row.append(button('Organize by date',()=>organizeTransfer(j),'secondary organize-transfer'));
+      renderCleanup(row,j,label);
+      if(expandedMissing.has(j.id)) row.querySelector('.cleanup-missing')?.setAttribute('open','');
+      section.append(row);
     }
-    if(j.current)row.append(node('p',j.current,'path'));if(j.output_folders?.length) { for(const folder of j.output_folders) row.append(node('p',folder,'path')); } else if(j.destination)row.append(node('p',j.destination,'path'));if(j.error)row.append(node('p',j.error));
-    if(activeStates.has(j.state) && j.state!=='deleting')row.append(button(j.state==='queued'?'Remove from queue':'Cancel transfer',async()=>{await api('cancel',{id:j.id});notice(j.state==='queued'?'Removed from queue.':'Cancellation requested. Waiting for the current disk operation to return.');await refresh();},'danger'));
-    if(j.can_resume) {
-      row.append(node('p',j.resume_needs_source?'Resume checks saved files and retries unfinished files. Select the original camera or drive first.':'All files were copied. Resume rechecks the NAS copies and finishes the transfer; the source is not needed.'));
-      row.append(button('Resume transfer',()=>resumeTransfer(j),'secondary resume-transfer'));
-    } else if(['failed','cancelled','interrupted'].includes(j.state)) {
-      row.append(node('p','This older transfer has no saved selection for resuming. Its NAS files are retained.'));
-    }
-    if(j.can_organize) row.append(button('Organize by date',()=>organizeTransfer(j),'secondary organize-transfer'));
-    renderCleanup(row,j,label);
-    if(expandedMissing.has(j.id)) row.querySelector('.cleanup-missing')?.setAttribute('open','');
-    $('jobs').append(row);
+    $('jobs').append(section);
   }controls();
 }
 async function queueDevice(d) {
@@ -315,11 +343,10 @@ async function deleteOriginals(job) {
     if(!devices.some(d=>d.id===source && d.usable)) throw new Error('Reconnect and select the original camera or drive, then try again.');
     const prepared=await api('delete/prepare',{id:job.id,device:source});
     feedback('Awaiting confirmation. Nothing is being deleted.');
-    const answer=prompt(`Permanently delete ${prepared.files} verified originals (${bytes(prepared.bytes)}) from ${prepared.source}?\nThe Pi rechecks each original and its NAS copy before deletion. Changed files, unreadable files or missing NAS backups stop the operation. Camera originals confirmed absent are reported separately after checking their backups. NAS copies are kept.\nType ${prepared.confirmation} to confirm.`);
-    if(answer===null) {feedback('Deletion not started. Confirmation was cancelled.');return;}
-    if(answer!==prepared.confirmation) throw new Error('Confirmation did not match. Nothing was deleted.');
+    const confirmed=confirm(`You are about to permanently delete ${prepared.files} original file${prepared.files===1?'':'s'} (${bytes(prepared.bytes)}) from ${prepared.source}.\n\nEach original and its NAS copy must pass verification before deletion. Already absent originals are reported separately. NAS copies are kept.\n\nClick OK to verify and delete, or Cancel to keep the originals.`);
+    if(!confirmed) {feedback('Deletion not started. Confirmation was cancelled.');return;}
     feedback('Starting verification and deletion…',true);
-    const result=await api('delete/confirm',{token:prepared.token,confirmation:answer});
+    const result=await api('delete/confirm',{token:prepared.token,confirmation:prepared.confirmation});
     cleanupFeedback.delete(job.id);
     renderJobs(jobsState.map(j=>j.id===job.id?{...j,...result,can_delete:false}:j));
     // Clear names which can now become stale. A new selection lists the device afresh.

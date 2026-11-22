@@ -352,6 +352,8 @@ class Transfers:
                     job["copy_complete"] = True
                 else:
                     job["device"] = device
+                    source = next((d for d in self.device_cache if d['id'] == device), None)
+                    job['device_history_key'] = source.get('history_key') if source else None
                 self.cancel_event.clear()
                 self.active_job = job
                 self.save()
@@ -385,6 +387,20 @@ class Transfers:
                     found += [d for d in self.device_cache if d["id"] == active_device and not any(f["id"] == d["id"] for f in found)]
                 self.device_cache = found
                 self.device_cache_time = time.monotonic()
+                # Enrich old records only when the exact connection ID matches.
+                # Stable serial-derived keys are for history display, never USB
+                # access, queue locking, resume approval or deletion authority.
+                changed = False
+                for job in self.jobs:
+                    source = next((d for d in found if d['id'] == job['device']), None)
+                    if not source:
+                        continue
+                    if source.get('history_key') and not job.get('device_history_key'):
+                        job['device_history_key'] = source['history_key']; changed = True
+                    if job.get('device_label') in (None, '', 'USB camera', 'USB drive') and source.get('label'):
+                        job['device_label'] = source['label']; changed = True
+                if changed:
+                    self.save()
                 return list(self.device_cache)
         finally:
             with self.lock:
@@ -541,6 +557,7 @@ class Transfers:
                 job.update(paths=paths, resume_version=1, attempts=1, checked_bytes=0,
                            device_label=source["label"] if source else ("USB camera" if str(device).startswith("camera:") else "USB drive"),
                            device_node=source.get("node", "") if source else "",
+                           device_history_key=source.get("history_key") if source else None,
                            needs_count=enqueue and estimate is None)
                 if estimate:
                     job.update(total_bytes=estimate["bytes"], total_files=estimate["files"],
