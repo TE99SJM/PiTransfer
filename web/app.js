@@ -162,7 +162,8 @@ function jobProgress(j) {
   const done=['complete','complete_with_skips','deleting'].includes(j.state), stopped=['failed','cancelled','interrupted'].includes(j.state);
   const clamp=n=>Math.max(0,Math.min(done?100:99.9,n));
   if(done) return {percent:100,title:'Copy complete',detail:`${bytes(j.bytes)} · ${j.files} files verified`};
-  if(j.state==='queued') return {percent:0,title:`Waiting${j.queue_position?' · queue position '+j.queue_position:''}`,detail:'Starts automatically after earlier transfers. Keep this device connected.'};
+  if(j.state==='queued') return {percent:0,title:j.waiting_for_discovery?'Waiting for device refresh':`Waiting${j.queue_position?' · queue position '+j.queue_position:''}`,
+    detail:j.waiting_for_discovery?'Starts automatically when the device refresh finishes. Keep this device connected.':'Starts automatically after earlier transfers. Keep this device connected.'};
   let percent=null,title='Preparing transfer',detail='';
   if(j.state==='counting') {title='Counting files';detail=`${j.total_files||0} files · ${bytes(j.total_bytes||0)} found so far`;}
   else if(j.phase==='rechecking' || (j.copy_complete && j.state==='resuming')) {
@@ -388,10 +389,11 @@ async function transfer(paths) {
     if(estimate.bytes+16*1024*1024>nasFree) throw new Error('Not enough free space on the NAS for this selection.');
     const skipped=estimate.skipped?`\n${estimate.skipped} unsupported item(s) will be skipped.`:'';
     if(!confirm(`Copy ${estimate.files} file(s), ${sizeText(estimate)}, from ${name} into camera_date folders inside ${destinationName(requestedFolder)}?${skipped}\nDifferent recording dates get separate folders. Date timezone: ${importTimezone}.\nOriginals will stay on the device.`)) return;
-    await api('transfer',{device:requestedDevice,paths,estimate_id:estimate.id,destination_folder:requestedFolder,import_timezone:importTimezone});
+    const started=await api('transfer',{device:requestedDevice,paths,estimate_id:estimate.id,destination_folder:requestedFolder,import_timezone:importTimezone});
     selected.clear();invalidateSize();
     for(const input of $('files').querySelectorAll('input')) input.checked=false;
-    notice('Transfer started on the Pi. You can close this window and check progress later.');
+    notice(started.state==='queued'?'Transfer is waiting for the device refresh and will start automatically. You can close this window.':
+      'Transfer started on the Pi. You can close this window and check progress later.');
     await refresh();
   } finally {preparing=false;controls();}
 }

@@ -262,6 +262,7 @@ class Transfers:
                          can_delete=j["state"] in {"complete", "complete_with_skips"} and j["files"] > 0 and j.get("cleanup", {}).get("state") != "complete",
                          can_organize=j["state"] in {"complete", "complete_with_skips"} and j.get("layout") != "camera_date",
                          queue_position=positions.get(j["id"], 0),
+                         waiting_for_discovery=j['state']=='queued' and self.discovering and self.active_job is None,
                          resume_needs_source=self.resume_mode(j) == "copy") for j in reversed(self.jobs)]
 
     @staticmethod
@@ -539,8 +540,11 @@ class Transfers:
                     or time.time() - estimate["completed_at"] > 300):
                 raise ValueError("Size estimate changed or expired. Calculate the size again.")
         with self.lock:
-            if not enqueue and (self.operation.locked() or self.discovering):
+            if not enqueue and (self.operation.locked() or self.queue):
                 raise RuntimeError("A drive operation is already in progress. Use Queue all files for another device.")
+            # A background device scan is not another transfer. Accept this
+            # confirmed selection into the idle queue; discovery's finally
+            # block starts it only after probing has released the camera.
             if len(self.queue) >= 10:
                 raise RuntimeError("The queue is full (10 waiting transfers).")
             if any(self.job_device(j) == device and j["state"] in ACTIVE for j in self.jobs):

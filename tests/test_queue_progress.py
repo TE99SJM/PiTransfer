@@ -74,6 +74,78 @@ class QueueProgressTest(unittest.TestCase):
         self.assertTrue(self.entered.wait(3))
         return job
 
+    @contextlib.contextmanager
+    def blocked_discovery(self, fail=False):
+        entered, finish = threading.Event(), threading.Event()
+        errors=[]; original=self.hw.devices
+        def scan(exclude=None):
+            entered.set()
+            if not finish.wait(5):raise RuntimeError('Discovery gate timed out')
+            if fail:raise RuntimeError('Discovery failed')
+            return original(exclude)
+        def discover():
+            try:self.engine.devices()
+            except Exception as exc:errors.append(str(exc))
+        with patch.object(self.hw,'devices',side_effect=scan):
+            self.engine.device_cache_time=0
+            worker=threading.Thread(target=discover)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                yield errors
+            finally:
+                finish.set();worker.join(5)
+                self.assertFalse(worker.is_alive())
+
+    def test_confirmed_copy_waits_for_discovery_then_copies_only_selected_files(self):
+        self.cameras[A].files['keep.THM']=b'not selected'
+        (self.hw.dst/'Video').mkdir()
+        with self.blocked_discovery() as errors:
+            job=self.engine.start(A,['video.MP4'],destination_folder='Video')
+            self.assertEqual(job['state'],'queued')
+            snapshot=self.engine.snapshot()[0]
+            self.assertTrue(snapshot['waiting_for_discovery'])
+            self.assertEqual(snapshot['queue_position'],1)
+            self.assertEqual(snapshot['paths'],['video.MP4'])
+            self.assertIsNone(self.engine.active_job)
+            self.assertFalse(self.engine.operation.locked())
+            self.assertEqual(self.cameras[A].opened,[])
+            with self.assertRaises(RuntimeError):self.engine.start(B,[''])
+            with self.assertRaises(RuntimeError):self.engine.start(A,[''],enqueue=True)
+        self.assertEqual(errors,[])
+        self.assertTrue(self.entered.wait(3))
+        self.gate.set();result=self.wait()[0]
+        self.assertEqual(result['state'],'complete',result)
+        self.assertFalse(result['waiting_for_discovery'])
+        self.assertEqual(result['files'],1)
+        self.assertTrue(result['destination'].startswith('Video/Pi-Imports/'))
+        self.assertFalse((self.hw.dst/result['destination']/'data/keep.THM').exists())
+        self.assertEqual(len(self.engine.jobs),1)
+
+    def test_copy_waiting_for_discovery_can_be_cancelled_before_any_camera_read(self):
+        with self.blocked_discovery():
+            job=self.engine.start(A,['video.MP4'])
+            self.engine.cancel(job['id'])
+        result=self.engine.snapshot()[0]
+        self.assertEqual(result['state'],'cancelled')
+        self.assertFalse(result['waiting_for_discovery'])
+        self.assertEqual(self.cameras[A].opened,[])
+        self.assertFalse(self.entered.is_set())
+        self.assertEqual(self.engine.queue,[])
+
+    def test_discovery_failure_releases_waiting_copy_without_weakening_device_checks(self):
+        with self.blocked_discovery(fail=True) as errors:
+            job=self.engine.start(A,['video.MP4'])
+            self.connected.remove(A)
+        self.assertEqual(errors,['Discovery failed'])
+        result=self.wait()[0]
+        self.assertEqual(result['id'],job['id'])
+        self.assertEqual(result['state'],'failed')
+        self.assertIn('disconnected',result['error'])
+        self.assertFalse(self.engine.discovering)
+        self.assertEqual(self.cameras[A].opened,[])
+        self.assertEqual(self.cameras[B].opened,[])
+
     def test_two_cameras_queue_and_finish_in_separate_folders(self):
         a = self.start_blocked()
         b = self.engine.start(B, [''], enqueue=True)
@@ -184,7 +256,8 @@ class QueueProgressTest(unittest.TestCase):
 
     def test_estimate_and_browse_still_refuse_active_source(self):
         self.start_blocked()
-        for action in (lambda:self.engine.browse(A,'',0), lambda:self.engine.estimate(A,['']), lambda:self.engine.eject(A)):
+        for action in (lambda:self.engine.browse(A,'',0), lambda:self.engine.estimate(A,['']), lambda:self.engine.eject(A),
+                       lambda:self.engine.start(B,['video.MP4'])):
             with self.assertRaises(RuntimeError):
                 action()
 

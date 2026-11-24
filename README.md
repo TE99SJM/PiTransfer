@@ -78,6 +78,8 @@ Queueing copies **all accessible files** on that device. To browse and select in
 
 Queued requests continue after the browser closes. If a device is unplugged or changes identity before its turn, its job fails instead of silently selecting another camera. After a Pi/service restart, saved active and waiting requests are marked interrupted and require manual Resume. Updating is blocked while requests are active or waiting. New-device discovery and multiple physical cameras still require validation on the actual Pi/USB hardware.
 
+If you confirm a copy while the automatic device refresh is running, the selection waits briefly with **Waiting for device refresh**, then starts without another click. The refresh cannot read the camera at the same time as that copy. Cancellation still works while waiting; an actual active operation still requires waiting or using **Queue all files** for another device.
+
 ## Resuming a transfer
 
 Select the original camera/card or USB drive, then press **Resume transfer** on its failed, cancelled or interrupted job. Confirm the source shown. Resume retains the original selection and NAS destination; choosing another NAS folder in the page does not redirect it. A reconnected camera may receive a new USB identifier, which is why you can explicitly select the source again. Keep the original card and selected files unchanged.
@@ -164,4 +166,4 @@ Additional tests cover flat date grouping, real MP4 timestamps, timezone boundar
 - [python-gphoto2 bindings and file APIs](https://github.com/jim-easterbrook/python-gphoto2)
 - [GoPro USB connection troubleshooting](https://community.gopro.com/s/article/Camera-is-not-Recognized-when-Plugged-into-a-Computer-USB-Port?language=en_US)
 
-Version: 0.6.4
+Version: 0.6.5

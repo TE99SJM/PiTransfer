@@ -74,13 +74,41 @@ def main():
                     assert not (hardware.dst/'Video/Pi-Imports').exists()
 
                     dialogs = []
+                    scan_entered,finish_scan=threading.Event(),threading.Event()
+                    scan_threads=[];scan_errors=[];original_devices=hardware.devices
+                    def slow_discovery(exclude=None):
+                        scan_entered.set()
+                        if not finish_scan.wait(30):raise RuntimeError('Browser discovery gate timed out')
+                        return original_devices(exclude)
+                    def background_discovery():
+                        try:application.transfers.devices()
+                        except Exception as exc:scan_errors.append(str(exc))
                     def confirm(dialog):
                         dialogs.append(dialog.message)
                         assert 'MiB' in dialog.message and '/Video/Pi-Imports' in dialog.message
+                        # Reproduce a status refresh racing the user's OK click.
+                        application.transfers.device_cache_time=0
+                        worker=threading.Thread(target=background_discovery)
+                        scan_threads.append(worker);worker.start()
+                        assert scan_entered.wait(5)
                         dialog.accept()
-                    page.once('dialog', confirm)
-                    page.locator('#copy-selected').click()
-                    expect(page.locator('#notice')).to_contain_text('You can close this window', timeout=15000)
+                    with patch.object(hardware,'devices',side_effect=slow_discovery):
+                        try:
+                            page.once('dialog', confirm)
+                            page.locator('#copy-selected').click()
+                            expect(page.locator('#notice')).to_contain_text('waiting for the device refresh',timeout=15000)
+                            expect(page.locator('#jobs .job-top .pill').first).to_have_text('queued')
+                            expect(page.locator('#jobs .progress-heading').first).to_contain_text('Waiting for device refresh')
+                            expect(page.locator('#jobs .copy-progress').first).to_have_attribute('value','0')
+                            expect(page.get_by_role('button',name='Remove from queue')).to_be_enabled()
+                            assert camera.opened==[], 'Copy overlapped device discovery'
+                            assert len(application.transfers.snapshot())==1
+                        finally:
+                            finish_scan.set()
+                            for worker in scan_threads:
+                                worker.join(5)
+                                assert not worker.is_alive()
+                    assert scan_errors==[],scan_errors
                     expect(page.locator('#jobs .job-top .pill').first).to_have_text('complete', timeout=15000)
                     assert len(dialogs) == 1
                     job = application.transfers.snapshot()[0]
