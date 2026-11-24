@@ -77,6 +77,10 @@ def main():
                     scan_entered,finish_scan=threading.Event(),threading.Event()
                     scan_threads=[];scan_errors=[];original_devices=hardware.devices
                     def slow_discovery(exclude=None):
+                        # Gate only the deliberate concurrent scan; the copy
+                        # flow's own status refresh must reach its confirmation.
+                        if threading.current_thread() not in scan_threads:
+                            return original_devices(exclude)
                         scan_entered.set()
                         if not finish_scan.wait(30):raise RuntimeError('Browser discovery gate timed out')
                         return original_devices(exclude)
