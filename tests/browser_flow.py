@@ -119,6 +119,14 @@ def main():
                     assert job['state'] == 'complete', job
                     assert (hardware.dst/job['output_folders'][0]/'photo.RAW').read_bytes() == b'raw'
                     expect(page.locator('#jobs')).to_contain_text('Estimated total: 2 file(s)')
+                    expect(page.locator('#current-jobs .job')).to_have_count(0)
+                    expect(page.locator('#completed-jobs .job')).to_have_count(1)
+                    expect(page.locator('#completed-jobs .job')).not_to_be_visible()
+                    expect(page.locator('#completed-summary')).to_have_text('Completed transfers (1)')
+                    page.locator('#completed-summary').click()
+                    expect(page.locator('#completed-jobs .job')).to_be_visible()
+                    page.evaluate('renderJobs(jobsState)')
+                    expect(page.locator('#completed-transfers')).to_have_js_property('open',True)
 
                     camera.unknown_size = True
                     page.get_by_label('note.txt', exact=True).check()
@@ -168,6 +176,7 @@ def main():
                     page.get_by_role('button', name='Resume transfer', exact=True).click()
                     expect(page.locator('#notice')).to_contain_text('Resume started on the Pi')
                     expect(page.locator('#jobs .job-top .pill').first).to_have_text('complete', timeout=15000)
+                    expect(page.locator('#current-jobs .job')).to_have_count(0)
                     assert camera.opened == downloads, 'Finalization downloaded the camera files again'
                     expect(page.locator('#jobs .job').first).to_contain_text('1 saved files rechecked')
 
@@ -197,6 +206,17 @@ def main():
                                      {'label':'GoPro HERO9 Black','ids':['other']}]
                     assert page.evaluate("groupTransfers([{id:'a',device:'camera:1',device_label:'Same model'},{id:'b',device:'camera:2',device_label:'Same model'}],[]).length")==2
 
+                    # Only unqualified success moves out of the main list. In
+                    # particular, a completed copy cannot hide deletion problems.
+                    classified=page.evaluate('''() => [
+                        {state:'complete'}, {state:'complete',cleanup:{state:'complete'}},
+                        {state:'complete_with_skips'}, {state:'complete',skipped:1},
+                        {state:'complete',error:'Organization failed'},
+                        ...['queued','starting','counting','copying','verifying','resuming','finalizing','organizing','deleting','failed','cancelled','interrupted'].map(state=>({state})),
+                        ...['checking','verifying','deleting','failed','cancelled','interrupted','complete_with_missing'].map(state=>({state:'complete',cleanup:{state}}))
+                    ].map(completedSuccessfully)''')
+                    assert classified==[True,True]+[False]*22, classified
+
                     # A progress bar exists for old resume jobs and for every camera.
                     assert abs(page.evaluate("jobProgress({state:'resuming',copy_complete:true,bytes:100,reused_bytes:28}).percent") - 28) < 1e-9
                     assert abs(page.evaluate("jobProgress({state:'verifying',total_bytes:100,bytes:100,checked_bytes:50}).percent") - 75) < 1e-9
@@ -205,7 +225,9 @@ def main():
                     cameras[second] = FakeCamera()
                     available.append(dict(available[0], id=second, label='Second USB camera', node='usb:002,004',history_key='camera:'+'b'*64))
                     gate, entered = threading.Event(), threading.Event()
+                    second_gate, second_entered = threading.Event(), threading.Event()
                     original_stream = camera.stream
+                    second_stream = cameras[second].stream
                     @contextlib.contextmanager
                     def gated_stream(path, expected, check):
                         entered.set()
@@ -214,6 +236,14 @@ def main():
                         with original_stream(path, expected, check) as chunks:
                             yield chunks
                     camera.stream = gated_stream
+                    @contextlib.contextmanager
+                    def gated_second_stream(path, expected, check):
+                        second_entered.set()
+                        if not second_gate.wait(30):
+                            raise RuntimeError('Second camera browser gate timed out')
+                        with second_stream(path, expected, check) as chunks:
+                            yield chunks
+                    cameras[second].stream=gated_second_stream
                     try:
                         active = application.transfers.start(DEVICE, ['note.txt'])
                         assert entered.wait(5)
@@ -231,7 +261,20 @@ def main():
                         expect(queued_card.locator('.copy-progress')).to_have_attribute('value','0')
                         expect(running_card.locator('.copy-progress')).to_have_count(1)
                         expect(queued_card.get_by_role('button',name='Remove from queue')).to_be_enabled()
+                        expect(page.locator('#current-jobs .job')).to_have_count(2)
+                        expect(page.locator('#current-jobs .copy-progress')).to_have_count(2)
+                        expect(page.locator('#completed-jobs .delete-originals').first).to_be_disabled()
+                        page.locator('#completed-summary').click()
+                        expect(page.locator('#completed-transfers')).to_have_js_property('open',False)
                         gate.set()
+                        expect(page.locator(f'#current-jobs [data-job-id="{active["id"]}"]')).to_have_count(0,timeout=15000)
+                        expect(page.locator('#current-jobs .job')).to_have_count(1)
+                        expect(queued_card).to_be_visible()
+                        assert second_entered.is_set()
+                        expect(running_card).not_to_be_visible()
+                        expect(page.locator('#completed-transfers')).to_have_js_property('open',False)
+                        expect(page.locator('#jobs .job')).to_have_count(len(application.transfers.snapshot()))
+                        second_gate.set()
                         expect(queued_card.locator('.pill')).to_have_text('complete',timeout=15000)
                         expect(running_card.locator('.pill')).to_have_text('complete',timeout=15000)
                         expect(queued_card.locator('.copy-progress')).to_have_attribute('value','100')
@@ -240,9 +283,13 @@ def main():
                         same_camera=page.locator('#jobs .device-group').filter(has=page.locator('.device-group-heading h3',has_text='GoPro HERO9 Black'))
                         expect(same_camera.locator('.job')).to_have_count(3)
                         expect(same_camera.locator('.copy-progress')).to_have_count(3)
+                        expect(page.locator('#current-jobs .job')).to_have_count(0)
+                        expect(queued_card).not_to_be_visible()
+                        page.locator('#completed-summary').click()
                     finally:
-                        gate.set()
+                        gate.set();second_gate.set()
                         camera.stream = original_stream
+                        cameras[second].stream=second_stream
 
                     # Deletion has its own confirmation and preserves the NAS outputs.
                     copied_card=page.locator(f'[data-job-id="{job["id"]}"]')
@@ -290,6 +337,8 @@ def main():
                         # Keep Playwright's event loop running to handle the async
                         # confirmation dialog before waiting on the worker gate.
                         expect(copied_card.locator('.cleanup-status')).to_contain_text('Verifying originals',timeout=15000)
+                        expect(page.locator(f'#current-jobs [data-job-id="{job["id"]}"]')).to_be_visible()
+                        expect(page.locator(f'#completed-jobs [data-job-id="{job["id"]}"]')).to_have_count(0)
                         assert started.is_set()
                         expect(copied_card.locator('.copy-progress')).to_have_attribute('value','100')
                         expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
@@ -302,6 +351,7 @@ def main():
                         expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','0')
                         finish_delete.set()
                         expect(copied_card).to_contain_text('Original deletion: complete',timeout=15000)
+                        expect(page.locator(f'#current-jobs [data-job-id="{job["id"]}"]')).to_have_count(0)
                     finally:
                         finish_check.set();finish_delete.set();camera.delete_verified=original_delete
                     assert 'DCIM/100GOPRO/photo.RAW' not in camera.files
@@ -315,9 +365,16 @@ def main():
                     expect(copied_card.locator('.cleanup-status')).to_contain_text('Originals deleted')
                     expect(page.locator('#files')).not_to_contain_text('DCIM')
 
-                    # Completion bars persist after a page reload; failed verification
+                    # Successful jobs stay hidden after reload, but records/actions
+                    # are available by expanding history. Failed verification
                     # stays below 100 even when the final checksum consumed every byte.
                     page.reload()
+                    expect(page.locator('#completed-summary')).to_have_text('Completed transfers (4)')
+                    expect(page.locator('#current-jobs .job')).to_have_count(0)
+                    expect(copied_card).not_to_be_visible()
+                    expect(page.locator('#completed-transfers')).to_have_js_property('open',False)
+                    page.locator('#completed-summary').click()
+                    expect(copied_card).to_be_visible()
                     expect(copied_card.locator('.verification-progress')).to_have_attribute('value','100')
                     expect(copied_card.locator('.deletion-progress')).to_have_attribute('value','100')
                     assert page.evaluate("cleanupProgress({state:'failed',total_files:1,files:0,verified_files:0,total_bytes:10,phase_bytes:10}).verification.percent")==99.9
@@ -335,6 +392,7 @@ def main():
                     legacy_card.get_by_role('button',name='Delete verified originals').click()
                     expect(legacy_card.locator('.cleanup-status')).to_contain_text('Deletion stopped with an error')
                     expect(legacy_card.locator('.cleanup-error')).to_contain_text('Original checksum changed')
+                    expect(page.locator(f'#current-jobs [data-job-id="{failed["id"]}"]')).to_be_visible()
                     expect(legacy_card.locator('.deletion-progress')).to_have_attribute('value','0')
                     expect(legacy_card.locator('.copy-progress')).to_have_attribute('value','100')
                     assert camera.files['note.txt']==b'changed original'
@@ -355,6 +413,8 @@ def main():
                     expect(legacy_card.get_by_role('button',name='Recheck remaining originals')).to_be_enabled()
                     page.reload()
                     expect(legacy_card.locator('.cleanup-status')).to_contain_text('1 already absent')
+                    expect(legacy_card).to_be_visible()
+                    expect(page.locator('#completed-transfers')).to_have_js_property('open',False)
                     page.once('dialog',lambda dialog:dialog.dismiss())
                     legacy_card.get_by_role('button',name='Recheck remaining originals').click()
                     expect(legacy_card.locator('.cleanup-status')).to_contain_text('Confirmation was cancelled')
@@ -367,7 +427,7 @@ def main():
                     assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'Mobile layout overflows'
                     assert not errors, errors
                     browser.close()
-                    print('Browser checks passed: folders, sizing, cancellation, transfer/resume, per-camera bars, second-camera queue, completion percentages, date organization, confirmed original deletion, and mobile width.')
+                    print('Browser checks passed: folders, sizing, cancellation, transfer/resume, per-camera bars, second-camera queue, automatic success hiding, collapsed history/reload, completion percentages, date organization, confirmed original deletion, visible cleanup failures/warnings, and mobile width.')
             finally:
                 server.shutdown()
 

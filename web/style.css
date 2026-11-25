@@ -13,3 +13,5 @@
 .cleanup-missing{font-size:12px;margin:12px 0}.cleanup-missing summary{cursor:pointer;font-weight:600}
 
 .device-group{margin-top:20px;padding:18px;border:1px solid var(--line);border-radius:14px;min-width:0}.device-group-heading{padding-bottom:12px;border-bottom:1px solid var(--line)}.device-group-heading h3{margin:0;font-size:17px;overflow-wrap:anywhere}.device-group-heading p{font-size:12px;margin:4px 0 0}.device-group .job-top strong{font-size:13px}.selection-summary{color:var(--muted)}@media(max-width:600px){.device-group{padding:12px}.device-group .job-top{align-items:flex-start}}
+
+#current-jobs>.empty{padding:18px 0;margin-bottom:0}#completed-transfers{margin-top:18px;border-top:1px solid var(--line);padding-top:12px}#completed-summary{cursor:pointer;font-weight:650;min-height:44px;padding:10px 0}#completed-summary:focus-visible{outline:3px solid #7ebc95;outline-offset:3px}#completed-transfers>p{font-size:12px;margin:4px 0}

@@ -261,13 +261,28 @@ function groupTransfers(jobs, connected=devices) {
   }
   return [...groups.values()];
 }
+function completedSuccessfully(j) {
+  return j.state==='complete' && !j.skipped && !j.error && !cleanupFeedback.has(j.id) &&
+    (!j.cleanup || (j.cleanup.state==='complete' && !j.cleanup.error));
+}
 function renderJobs(jobs) {
   for(const j of jobs) if(j.state==='deleting' || j.cleanup?.state==='complete') cleanupFeedback.delete(j.id);
   const expandedMissing=new Set([...$('jobs').querySelectorAll('.cleanup-missing[open]')].map(panel=>panel.closest('.job').dataset.jobId));
   jobsState=jobs;
-  busy=jobs.some(j=>activeStates.has(j.state));$('jobs').replaceChildren();
-  if(!jobs.length) $('jobs').append(node('p','Your transfers will appear here.','empty'));
-  for(const group of groupTransfers(jobs)) {
+  busy=jobs.some(j=>activeStates.has(j.state));
+  const groups=groupTransfers(jobs), completed=jobs.filter(completedSuccessfully).length;
+  for(const [id,successful] of [['current-jobs',false],['completed-jobs',true]]) {
+    const container=$(id);container.replaceChildren();
+    const visible=groups.map(group=>({...group,jobs:group.jobs.filter(j=>completedSuccessfully(j)===successful)})).filter(group=>group.jobs.length);
+    renderJobGroups(visible,container,expandedMissing);
+  }
+  if(completed===jobs.length) $('current-jobs').append(node('p','No active transfers or actions needing attention.','empty'));
+  $('completed-transfers').hidden=!completed;
+  $('completed-summary').textContent=`Completed transfers (${completed})`;
+  controls();
+}
+function renderJobGroups(groups,container,expandedMissing) {
+  for(const group of groups) {
     const section=node('section',undefined,'device-group');section.dataset.deviceGroup=group.key;
     section.setAttribute('aria-label',`${group.label} transfers`);
     const heading=node('div',undefined,'device-group-heading');
@@ -300,8 +315,8 @@ function renderJobs(jobs) {
       if(expandedMissing.has(j.id)) row.querySelector('.cleanup-missing')?.setAttribute('open','');
       section.append(row);
     }
-    $('jobs').append(section);
-  }controls();
+    container.append(section);
+  }
 }
 async function queueDevice(d) {
   preparing=true;controls();
